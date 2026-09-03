@@ -1,0 +1,15 @@
+[package]
+name = "python"
+version = "0.1.0"
+edition = "2024"
+description = "读取文件原始字节流，经 PowerShell 原样写入输出目录。支持单文件、整目录与递归子目录。"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "wrap_help", "unicode"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
