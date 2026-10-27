@@ -56,13 +56,9 @@ pub fn is_tool_temp(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn unique_marked_xlsx(dir: &Path, file_stem: &str, kind: &str) -> PathBuf {
+fn unique_marked_xlsx(dir: &Path, file_stem: &str) -> PathBuf {
     for n in 1u32.. {
-        let name = if kind.is_empty() {
-            format!("{file_stem}{TEMP_MARK}{n}.xlsx")
-        } else {
-            format!("{file_stem}{TEMP_MARK}{kind}-{n}.xlsx")
-        };
+        let name = format!("{file_stem}{TEMP_MARK}{n}.xlsx");
         let p = dir.join(name);
         if !p.exists() {
             return p;
@@ -74,13 +70,7 @@ fn unique_marked_xlsx(dir: &Path, file_stem: &str, kind: &str) -> PathBuf {
 /// 非 xlsx 源文件的中间副本。始终带 `.goodnice-` 标记，绝不占用用户已有的同名 `.xlsx`。
 pub fn xlsx_intermediate_path(source: &Path) -> PathBuf {
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
-    unique_marked_xlsx(parent, &stem(source), "")
-}
-
-/// PowerShell 先写入的输出侧临时 xlsx（随后再改回原本后缀）。
-pub fn xlsx_write_path(dest_final: &Path) -> PathBuf {
-    let parent = dest_final.parent().unwrap_or_else(|| Path::new("."));
-    unique_marked_xlsx(parent, &stem(dest_final), "write")
+    unique_marked_xlsx(parent, &stem(source))
 }
 
 /// 转成绝对路径，但不调用 canonicalize，避免 Windows 上出现 `\\?\` 前缀。

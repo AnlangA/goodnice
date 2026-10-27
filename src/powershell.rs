@@ -23,8 +23,8 @@ fn powershell_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     cmd
 }
 
-/// 单次调用脚本（供单文件或无常驻会话回退使用）。
-/// 已移除低效的全文正则 `-replace '\s', ''`，因为 Rust 侧标准 Base64 编码不含空白字符。
+/// 单次调用脚本（供单文件或无常驻会话回退使用）：
+/// 字节流在内存中解码并计算 MD5，处理完成后直接将最终文件存盘至源文件位置（若源文件被锁无法替换则回退保存至输出目录）。
 const PS_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -33,20 +33,41 @@ $ProgressPreference = 'SilentlyContinue'
 $b64 = [Console]::In.ReadToEnd().Trim()
 $bytes = [Convert]::FromBase64String($b64)
 
+$sourceFile = $env:GOODNICE_SOURCE_FILE
 $outDir = $env:GOODNICE_OUT_DIR
 $outFile = $env:GOODNICE_OUT_FILE
-if ([string]::IsNullOrWhiteSpace($outDir) -or [string]::IsNullOrWhiteSpace($outFile)) {
-    throw '内部错误: 未设置 GOODNICE_OUT_DIR / GOODNICE_OUT_FILE'
+if ([string]::IsNullOrWhiteSpace($sourceFile) -or [string]::IsNullOrWhiteSpace($outDir) -or [string]::IsNullOrWhiteSpace($outFile)) {
+    throw '内部错误: 未设置 GOODNICE_SOURCE_FILE / GOODNICE_OUT_DIR / GOODNICE_OUT_FILE'
 }
-New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-[System.IO.File]::WriteAllBytes($outFile, $bytes)
 
-$written = [System.IO.File]::ReadAllBytes($outFile)
+$md5 = [System.Security.Cryptography.MD5]::Create()
+$h1 = $md5.ComputeHash($bytes)
+
+$deletedSource = $false
+$deleteErr = ''
+try {
+    if ([System.IO.File]::Exists($sourceFile)) {
+        [System.IO.File]::Delete($sourceFile)
+    } elseif ([System.IO.Directory]::Exists($sourceFile)) {
+        throw "目标路径是目录而非文件: $sourceFile"
+    }
+    $deletedSource = $true
+} catch {
+    $deleteErr = $_.Exception.Message -replace '[\r\n]+', ' '
+}
+
+$targetPath = if ($deletedSource) { $sourceFile } else {
+    if (-not [System.IO.Directory]::Exists($outDir)) {
+        [System.IO.Directory]::CreateDirectory($outDir) | Out-Null
+    }
+    $outFile
+}
+
+[System.IO.File]::WriteAllBytes($targetPath, $bytes)
+$written = [System.IO.File]::ReadAllBytes($targetPath)
 if ($bytes.Length -ne $written.Length) {
     throw '验证失败: 写入文件的长度与接收的数据不一致!'
 }
-$md5 = [System.Security.Cryptography.MD5]::Create()
-$h1 = $md5.ComputeHash($bytes)
 $h2 = $md5.ComputeHash($written)
 for ($i = 0; $i -lt $h1.Length; $i++) {
     if ($h1[$i] -ne $h2[$i]) {
@@ -54,15 +75,19 @@ for ($i = 0; $i -lt $h1.Length; $i++) {
     }
 }
 
+if (-not $deletedSource) {
+    throw "替换源文件失败: $sourceFile ($deleteErr)；输出文件保留在 $outFile"
+}
+
 if ($env:GOODNICE_VERBOSE -eq '1') {
-    $fi = Get-Item -LiteralPath $outFile
+    $fi = Get-Item -LiteralPath $targetPath
     [Console]::Out.WriteLine('PowerShell written: ' + $fi.FullName + ' (' + $fi.Length + ' bytes)')
-    [Console]::Out.WriteLine('PowerShell 验证通过: 写入字节流与接收数据完全一致')
+    [Console]::Out.WriteLine('PowerShell 验证通过: 内存字节流与最终存盘数据完全一致')
 }
 "#;
 
 /// 常驻 PowerShell 工作进程脚本：
-/// 批量处理多个文件时只启动一次 PowerShell / .NET 运行时，复用同一个 MD5 实例，消除每个文件 300~600ms 的进程启动开销。
+/// 全程在内存中接收字节流并计算哈希，处理完成后直接将最终文件写入目标盘位（无需在磁盘创建临时输出目录和中间输出文件）。
 const PS_WORKER_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -77,29 +102,48 @@ while ($true) {
     $header = [Console]::In.ReadLine()
     if ($null -eq $header -or $header -eq 'EXIT') { break }
     try {
-        $parts = $header.Split('|', 3)
-        if ($parts.Length -lt 3) {
+        $parts = $header.Split('|', 4)
+        if ($parts.Length -lt 4) {
             throw '内部协议错误: 请求头格式无效'
         }
         $verbose = $parts[0]
-        $outDir = $utf8.GetString([Convert]::FromBase64String($parts[1]))
-        $outFile = $utf8.GetString([Convert]::FromBase64String($parts[2]))
+        $sourceFile = $utf8.GetString([Convert]::FromBase64String($parts[1]))
+        $outDir = $utf8.GetString([Convert]::FromBase64String($parts[2]))
+        $outFile = $utf8.GetString([Convert]::FromBase64String($parts[3]))
         $b64 = [Console]::In.ReadLine()
         if ($null -eq $b64) {
             throw '内部协议错误: 未收到文件字节流负载'
         }
         $bytes = [Convert]::FromBase64String($b64)
+        $h1 = $md5.ComputeHash($bytes)
 
-        if (-not [System.IO.Directory]::Exists($outDir)) {
-            [System.IO.Directory]::CreateDirectory($outDir) | Out-Null
+        $deletedSource = $false
+        $deleteErr = ''
+        try {
+            if ([System.IO.File]::Exists($sourceFile)) {
+                [System.IO.File]::Delete($sourceFile)
+            } elseif ([System.IO.Directory]::Exists($sourceFile)) {
+                throw "目标路径是目录而非文件: $sourceFile"
+            }
+            $deletedSource = $true
+        } catch {
+            $deleteErr = $_.Exception.Message -replace '[\r\n]+', ' '
         }
-        [System.IO.File]::WriteAllBytes($outFile, $bytes)
 
-        $written = [System.IO.File]::ReadAllBytes($outFile)
+        $targetPath = if ($deletedSource) {
+            $sourceFile
+        } else {
+            if (-not [System.IO.Directory]::Exists($outDir)) {
+                [System.IO.Directory]::CreateDirectory($outDir) | Out-Null
+            }
+            $outFile
+        }
+
+        [System.IO.File]::WriteAllBytes($targetPath, $bytes)
+        $written = [System.IO.File]::ReadAllBytes($targetPath)
         if ($bytes.Length -ne $written.Length) {
             throw '验证失败: 写入文件的长度与接收的数据不一致!'
         }
-        $h1 = $md5.ComputeHash($bytes)
         $h2 = $md5.ComputeHash($written)
         for ($i = 0; $i -lt $h1.Length; $i++) {
             if ($h1[$i] -ne $h2[$i]) {
@@ -107,9 +151,15 @@ while ($true) {
             }
         }
 
+        if (-not $deletedSource) {
+            [Console]::Out.WriteLine('GOODNICE_FALLBACK|' + $deleteErr)
+            [Console]::Out.Flush()
+            continue
+        }
+
         if ($verbose -eq '1') {
-            [Console]::Out.WriteLine('GOODNICE_LOG|PowerShell written: ' + $outFile + ' (' + $written.Length + ' bytes)')
-            [Console]::Out.WriteLine('GOODNICE_LOG|PowerShell 验证通过: 写入字节流与接收数据完全一致')
+            [Console]::Out.WriteLine('GOODNICE_LOG|PowerShell written: ' + $targetPath + ' (' + $written.Length + ' bytes)')
+            [Console]::Out.WriteLine('GOODNICE_LOG|PowerShell 验证通过: 内存字节流与最终存盘数据完全一致')
         }
         [Console]::Out.WriteLine('GOODNICE_OK')
         [Console]::Out.Flush()
@@ -203,18 +253,21 @@ impl PowerShellSession {
         &self.program
     }
 
-    pub fn write_bytes(
+    /// 将内存中的字节流直接通过常驻 PowerShell 校验并存盘至 `source_file`（若源文件被锁无法替换则保存至 `fallback_file`）。
+    pub fn write_final_file(
         &mut self,
         data: &[u8],
-        dest_dir: &Path,
-        dest_file: &Path,
+        source_file: &Path,
+        fallback_dir: &Path,
+        fallback_file: &Path,
         verbose: bool,
     ) -> Result<()> {
-        let dir_b64 = STANDARD.encode(dest_dir.to_string_lossy().as_bytes());
-        let file_b64 = STANDARD.encode(dest_file.to_string_lossy().as_bytes());
+        let src_b64 = STANDARD.encode(source_file.to_string_lossy().as_bytes());
+        let dir_b64 = STANDARD.encode(fallback_dir.to_string_lossy().as_bytes());
+        let file_b64 = STANDARD.encode(fallback_file.to_string_lossy().as_bytes());
         let v_flag = if verbose { "1" } else { "0" };
 
-        writeln!(self.stdin, "{v_flag}|{dir_b64}|{file_b64}")
+        writeln!(self.stdin, "{v_flag}|{src_b64}|{dir_b64}|{file_b64}")
             .context("向 PowerShell 会话发送请求头失败")?;
         let payload = STANDARD.encode(data);
         self.stdin
@@ -235,7 +288,7 @@ impl PowerShellSession {
             if n == 0 {
                 bail!(
                     "PowerShell 会话意外终止。目标: {}",
-                    dest_file.display()
+                    source_file.display()
                 );
             }
             let trimmed = line.trim();
@@ -245,10 +298,16 @@ impl PowerShellSession {
                 }
             } else if trimmed == "GOODNICE_OK" {
                 return Ok(());
+            } else if let Some(lock_err) = trimmed.strip_prefix("GOODNICE_FALLBACK|") {
+                bail!(
+                    "替换源文件失败: {} ({lock_err})；输出文件保留在 {}",
+                    source_file.display(),
+                    fallback_file.display()
+                );
             } else if let Some(err_msg) = trimmed.strip_prefix("GOODNICE_ERR|") {
                 bail!(
                     "PowerShell 写入失败: {err_msg}。目标: {}",
-                    dest_file.display()
+                    source_file.display()
                 );
             }
         }
@@ -272,12 +331,13 @@ fn encode_command(script: &str) -> String {
     STANDARD.encode(bytes)
 }
 
-/// 把原始字节流交给单次 PowerShell 进程，由其写入目标文件并校验 MD5。
+/// 把内存中的原始字节流交给单次 PowerShell 进程，直接写入最终目标文件并校验 MD5。
 pub fn write_bytes_via_powershell(
     powershell: &OsString,
     data: &[u8],
-    dest_dir: &Path,
-    dest_file: &Path,
+    source_file: &Path,
+    fallback_dir: &Path,
+    fallback_file: &Path,
     verbose: bool,
 ) -> Result<()> {
     let encoded = encode_command(PS_SCRIPT);
@@ -291,8 +351,9 @@ pub fn write_bytes_via_powershell(
             "-EncodedCommand",
             &encoded,
         ])
-        .env("GOODNICE_OUT_DIR", dest_dir.as_os_str())
-        .env("GOODNICE_OUT_FILE", dest_file.as_os_str())
+        .env("GOODNICE_SOURCE_FILE", source_file.as_os_str())
+        .env("GOODNICE_OUT_DIR", fallback_dir.as_os_str())
+        .env("GOODNICE_OUT_FILE", fallback_file.as_os_str())
         .env("GOODNICE_VERBOSE", if verbose { "1" } else { "0" })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -321,7 +382,7 @@ pub fn write_bytes_via_powershell(
         let mut msg = format!(
             "PowerShell 写入失败 (退出码 {})。目标: {}",
             output.status.code().unwrap_or(-1),
-            dest_file.display()
+            source_file.display()
         );
         if !stderr.is_empty() {
             msg.push('\n');

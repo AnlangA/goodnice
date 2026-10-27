@@ -1,15 +1,23 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result, bail};
 
 use crate::pathutil::{
-    is_tool_temp, is_within, is_xlsx, strip_prefix_ci, suffix, xlsx_intermediate_path,
-    xlsx_write_path,
+    is_within, is_xlsx, strip_prefix_ci, suffix, xlsx_intermediate_path,
 };
 use crate::powershell::{self, PowerShellSession};
+
+/// Windows 内核页缓存临时标志 + 隐藏属性：
+/// `FILE_ATTRIBUTE_TEMPORARY (0x0100)` 指示 Windows Cache Manager 将临时 `.xlsx` 句柄数据驻留在内存缓存中，不主动刷写到物理磁盘；
+/// `FILE_ATTRIBUTE_HIDDEN (0x0002)` 在资源管理器中隐藏该临时句柄。
+#[cfg(windows)]
+const TEMP_CACHE_FILE_FLAGS: u32 = 0x0000_0100 | 0x0000_0002;
 
 pub struct ProcessConfig {
     pub output_dir: PathBuf,
@@ -43,28 +51,30 @@ impl DeleteOnDrop {
 
 impl Drop for DeleteOnDrop {
     fn drop(&mut self) {
-        // 仅删除本次 create_new 得到的副本；成功路径会先 disarm。
+        // 仅删除本次 create_new 得到的副本；成功路径会先显式删除并 disarm。
         if self.armed && self.path.exists() {
             let _ = fs::remove_file(&self.path);
         }
     }
 }
 
-/// 只创建新文件，存在则失败，避免覆盖用户已有的 `.xlsx`。
+/// 创建内核内存缓存的临时 `.xlsx` 句柄（存在则失败，避免覆盖用户已有的 `.xlsx`），不强制刷盘。
 fn copy_new(src: &Path, dst: &Path) -> io::Result<u64> {
     let mut from = fs::File::open(src)?;
-    let mut to = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dst)?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        opts.custom_flags(TEMP_CACHE_FILE_FLAGS);
+    }
+    let mut to = opts.open(dst)?;
     let mut guard = DeleteOnDrop::new(dst.to_path_buf());
     let n = io::copy(&mut from, &mut to)?;
-    to.flush()?;
     guard.disarm();
     Ok(n)
 }
 
-/// 计算源文件在输出目录中的路径（恢复原后缀后，还会移回源路径）。
+/// 计算源文件在回退输出目录中的路径（仅当源文件被占用无法原位落盘时使用）。
 pub fn planned_dest(source: &Path, input_root: Option<&Path>, output_dir: &Path) -> PathBuf {
     match input_root {
         Some(root) => match strip_prefix_ci(source, root) {
@@ -98,9 +108,8 @@ pub fn process_file_with_session(
         vlog(
             cfg,
             &format!(
-                "[dry-run] {} -> {}；校验并恢复后缀后，删除源文件，再移回 {}",
+                "[dry-run] {} -> 内存读取字节流并校验后直接存盘替换 {}",
                 source.display(),
-                dest_final.display(),
                 source.display()
             ),
         );
@@ -110,10 +119,10 @@ pub fn process_file_with_session(
         });
     }
 
-    // 第 1 步：非 xlsx 则记录原格式，复制一份并把后缀改成 xlsx（原文件保留）
+    // 第 1 步：非 xlsx 则创建内存页缓存的临时 xlsx 句柄（FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_HIDDEN）
     let mut tmp_guard: Option<DeleteOnDrop> = None;
     let read_path = if originally_xlsx {
-        vlog(cfg, "已是 xlsx 格式，直接进入读取");
+        vlog(cfg, "已是 xlsx 格式，直接进入内存读取");
         source.to_path_buf()
     } else {
         vlog(
@@ -134,7 +143,7 @@ pub fn process_file_with_session(
                 let marked = xlsx_intermediate_path(source);
                 copy_new(source, &marked).with_context(|| {
                     format!(
-                        "复制为 xlsx 失败: {} -> {}",
+                        "创建临时 xlsx 缓存失败: {} -> {}",
                         source.display(),
                         marked.display()
                     )
@@ -144,7 +153,7 @@ pub fn process_file_with_session(
             Err(err) => {
                 return Err(err).with_context(|| {
                     format!(
-                        "复制为 xlsx 失败: {} -> {}",
+                        "创建临时 xlsx 缓存失败: {} -> {}",
                         source.display(),
                         sibling.display()
                     )
@@ -154,7 +163,7 @@ pub fn process_file_with_session(
         vlog(
             cfg,
             &format!(
-                "已复制原文件并改后缀为 xlsx: {} (原文件保留)",
+                "已在内存缓存创建临时 xlsx 句柄: {} (原文件保留)",
                 xlsx_file.display()
             ),
         );
@@ -162,81 +171,50 @@ pub fn process_file_with_session(
         xlsx_file
     };
 
-    // 第 2 步：读取字节流，完全通过 PowerShell 写入输出目录
-    vlog(cfg, &format!("读取: {}", read_path.display()));
+    // 第 2 步：将解密后的字节流读入内存，全程在内存中经管道传给 PowerShell 校验并直接将最终文件存盘
+    vlog(cfg, &format!("读取字节流至内存: {}", read_path.display()));
     let data =
         fs::read(&read_path).with_context(|| format!("读取失败: {}", read_path.display()))?;
-    vlog(cfg, &format!("读取到 {} 字节", data.len()));
+    vlog(cfg, &format!("内存已缓存 {} 字节", data.len()));
 
-    let dest_write = if originally_xlsx {
-        dest_final.clone()
-    } else {
-        xlsx_write_path(&dest_final)
-    };
-    let dest_dir = dest_write
+    let dest_dir = dest_final
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
     match session {
         Some(sess) => {
-            sess.write_bytes(&data, &dest_dir, &dest_write, cfg.verbose)?;
+            sess.write_final_file(&data, source, &dest_dir, &dest_final, cfg.verbose)?;
         }
         None => {
             powershell::write_bytes_via_powershell(
                 &cfg.powershell,
                 &data,
+                source,
                 &dest_dir,
-                &dest_write,
+                &dest_final,
                 cfg.verbose,
             )?;
         }
     }
     vlog(
         cfg,
-        "验证通过: 输出文件字节流与读取数据完全一致(由 PowerShell 校验)",
+        &format!(
+            "验证通过并已将最终文件存盘: {} (由 PowerShell 内存校验)",
+            source.display()
+        ),
     );
 
-    // 第 3 步：原本不是 xlsx，则把输出文件改回原本格式，并删除中间 xlsx 副本
-    if !originally_xlsx {
-        if dest_write != dest_final {
-            // 直接 rename 可能被系统拦截，改用复制+删除（与 Python 脚本相同）
-            fs::copy(&dest_write, &dest_final).with_context(|| {
-                format!(
-                    "改回原本格式失败: {} -> {}",
-                    dest_write.display(),
-                    dest_final.display()
-                )
-            })?;
-            remove_tool_temp(&dest_write)?;
-            vlog(
-                cfg,
-                &format!("输出文件已改回原本格式: {}", dest_final.display()),
-            );
-        }
-        if let Some(guard) = tmp_guard.as_mut() {
-            remove_file_best_effort(&guard.path)
-                .with_context(|| format!("删除中间文件失败: {}", guard.path.display()))?;
-            vlog(
-                cfg,
-                &format!("已删除中间的 xlsx 副本: {}", guard.path.display()),
-            );
-            guard.disarm();
-        }
+    // 第 3 步：最终文件存盘完成后，立即删除临时 xlsx 缓存句柄
+    if let Some(guard) = tmp_guard.as_mut() {
+        remove_file_best_effort(&guard.path)
+            .with_context(|| format!("删除临时文件失败: {}", guard.path.display()))?;
+        vlog(
+            cfg,
+            &format!("已删除临时 xlsx 缓存文件: {}", guard.path.display()),
+        );
+        guard.disarm();
     }
-
-    // 第 4、5 步：原流程全部成功后，删除源文件，再把输出文件移回原路径。
-    replace_source(source, &dest_final).with_context(|| {
-        format!(
-            "替换源文件失败: {}；输出文件保留在 {}",
-            source.display(),
-            dest_final.display()
-        )
-    })?;
-    vlog(
-        cfg,
-        &format!("已删除源文件并移回输出文件: {}", source.display()),
-    );
 
     Ok(FileOutcome {
         dest: source.to_path_buf(),
@@ -259,27 +237,7 @@ pub fn validate_output_dir(source: &Path, output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn replace_source(source: &Path, output: &Path) -> Result<()> {
-    if !output.is_file() {
-        bail!("输出文件不存在: {}", output.display());
-    }
-    fs::remove_file(source).with_context(|| format!("删除源文件失败: {}", source.display()))?;
-    if fs::rename(output, source).is_err() {
-        // 跨磁盘或系统不允许 rename 时，用创建新文件、复制、删除实现移动。
-        copy_new(output, source).with_context(|| {
-            format!(
-                "移回源目录失败: {} -> {}",
-                output.display(),
-                source.display()
-            )
-        })?;
-        fs::remove_file(output)
-            .with_context(|| format!("文件已移回，删除输出副本失败: {}", output.display()))?;
-    }
-    Ok(())
-}
-
-/// 第 6 步：批量处理成功后从内向外删除空输出目录，不跟随目录链接。
+/// 批量处理成功后从内向外删除空输出目录，不跟随目录链接。
 /// 返回 false 表示仍有文件或链接，需要保留目录。
 pub fn cleanup_output_dir(output_dir: &Path) -> Result<bool> {
     let metadata = match fs::symlink_metadata(output_dir) {
@@ -312,13 +270,6 @@ fn remove_file_best_effort(path: &Path) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
-}
-
-fn remove_tool_temp(path: &Path) -> Result<()> {
-    if !is_tool_temp(path) {
-        bail!("拒绝删除非本工具中间文件: {}", path.display());
-    }
-    remove_file_best_effort(path).with_context(|| format!("删除中间文件失败: {}", path.display()))
 }
 
 fn vlog(cfg: &ProcessConfig, msg: &str) {
@@ -357,58 +308,21 @@ mod tests {
         assert_eq!(dest, PathBuf::from("output").join("sub").join("a.pdf"));
     }
 
+    #[cfg(windows)]
     #[test]
-    fn replaces_source_with_output_and_removes_output_file() {
+    fn copy_new_marks_temporary_and_hidden_attributes_in_ram_cache() {
+        use std::os::windows::fs::MetadataExt;
         let dir = tempdir().unwrap();
-        let source = dir.path().join("a.pdf");
-        let output = dir.path().join("output.pdf");
-        fs::write(&source, b"original").unwrap();
-        fs::write(&output, b"processed").unwrap();
+        let src = dir.path().join("a.pdf");
+        let dst = dir.path().join("a.xlsx");
+        fs::write(&src, b"in-memory-cache-payload").unwrap();
 
-        replace_source(&source, &output).unwrap();
-
-        assert_eq!(fs::read(&source).unwrap(), b"processed");
-        assert!(!output.exists());
-    }
-
-    #[test]
-    fn replaces_source_from_a_separate_location() {
-        // 系统临时目录与仓库位于不同磁盘时，验证跨磁盘移动的复制回退。
-        let source_dir =
-            tempfile::tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("target")).unwrap();
-        let output_dir = tempdir().unwrap();
-        let source = source_dir.path().join("a.pdf");
-        let output = output_dir.path().join("a.pdf");
-        fs::write(&source, b"original").unwrap();
-        fs::write(&output, b"processed").unwrap();
-
-        replace_source(&source, &output).unwrap();
-
-        assert_eq!(fs::read(&source).unwrap(), b"processed");
-        assert!(!output.exists());
-    }
-
-    #[test]
-    fn missing_output_does_not_delete_source() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("a.pdf");
-        fs::write(&source, b"original").unwrap();
-
-        assert!(replace_source(&source, &dir.path().join("missing.pdf")).is_err());
-        assert_eq!(fs::read(source).unwrap(), b"original");
-    }
-
-    #[test]
-    fn failed_source_deletion_preserves_output() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("directory");
-        let output = dir.path().join("output.pdf");
-        fs::create_dir(&source).unwrap();
-        fs::write(&output, b"processed").unwrap();
-
-        assert!(replace_source(&source, &output).is_err());
-        assert_eq!(fs::read(output).unwrap(), b"processed");
-        assert!(source.is_dir());
+        let n = copy_new(&src, &dst).unwrap();
+        assert_eq!(n, 23);
+        let attrs = fs::metadata(&dst).unwrap().file_attributes();
+        // FILE_ATTRIBUTE_TEMPORARY (0x100) | FILE_ATTRIBUTE_HIDDEN (0x2)
+        assert_ne!(attrs & 0x0000_0100, 0, "應帶有 FILE_ATTRIBUTE_TEMPORARY 標誌");
+        assert_ne!(attrs & 0x0000_0002, 0, "應帶有 FILE_ATTRIBUTE_HIDDEN 標誌");
     }
 
     #[test]
