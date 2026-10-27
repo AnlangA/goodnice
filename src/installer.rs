@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::c_void;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 pub const APP_NAME: &str = "Dot";
 pub const SHORTCUT_NAME: &str = "dot.lnk";
 pub const SHIM_NAME: &str = "dot.cmd";
+pub const VBS_SHIM_NAME: &str = "dot.vbs";
 pub const PYTHON_EXE_NAME: &str = "python.exe";
 pub const UNINSTALL_EXE_NAME: &str = "uninstall.exe";
 pub const CONTEXT_MENU_KEY_NAME: &str = "GoodniceDot";
@@ -44,6 +45,8 @@ pub struct InstallConfig {
     pub env_subkey: String,
     pub classes_subkey: String,
     pub uninstall_subkey: String,
+    pub enable_path_env: bool,
+    pub enable_context_menu: bool,
     pub broadcast_changes: bool,
 }
 
@@ -68,6 +71,8 @@ impl InstallConfig {
             env_subkey: SYSTEM_ENV_SUBKEY.to_string(),
             classes_subkey: SYSTEM_CLASSES_SUBKEY.to_string(),
             uninstall_subkey: SYSTEM_UNINSTALL_SUBKEY.to_string(),
+            enable_path_env: true,
+            enable_context_menu: true,
             broadcast_changes: true,
         }
     }
@@ -87,27 +92,67 @@ impl InstallConfig {
     pub fn cmd_shim_path(&self) -> PathBuf {
         self.start_menu_dir.join(SHIM_NAME)
     }
+
+    pub fn vbs_shim_path(&self) -> PathBuf {
+        self.start_menu_dir.join(VBS_SHIM_NAME)
+    }
 }
 
-/// 生成文件右键菜单命令（通过开始菜单中的 dot.lnk 调用，不直接暴露 python.exe）
-pub fn file_context_command(shortcut_path: &Path) -> String {
+/// 生成文件右键菜单命令（通过 wscript.exe 静默无弹窗启动开始菜单目录下的 dot.vbs -> dot.lnk，不暴露 python.exe）
+pub fn file_context_command(vbs_shim_path: &Path) -> String {
     format!(
-        "cmd.exe /d /s /c \"\"{}\" \"%1\"\"",
-        shortcut_path.display()
+        "wscript.exe //B //NoLogo \"{}\" \"%1\"",
+        vbs_shim_path.display()
     )
 }
 
-/// 生成目录及目录空白处右键菜单命令（默认带 -r 递归处理，通过 dot.lnk 调用）
-pub fn directory_context_command(shortcut_path: &Path) -> String {
+/// 生成目录及目录空白处右键菜单命令（默认带 -r 递归处理，通过 wscript.exe 静默无弹窗调用 dot.vbs -> dot.lnk）
+pub fn directory_context_command(vbs_shim_path: &Path) -> String {
     format!(
-        "cmd.exe /d /s /c \"\"{}\" -r \"%V\\.\"\"",
-        shortcut_path.display()
+        "wscript.exe //B //NoLogo \"{}\" -r \"%V\"",
+        vbs_shim_path.display()
     )
 }
 
-/// 生成隐藏的 dot.cmd 内容：转发所有参数给同目录下的 dot.lnk 快捷方式
+/// 生成隐藏的 dot.cmd 内容：供命令行终端输入 `dot` 时转发所有参数给同目录下的 dot.lnk 快捷方式
 pub fn shim_script_content() -> &'static str {
     "@\"%~dp0dot.lnk\" %*\r\n"
+}
+
+/// 生成隐藏的 dot.vbs 内容：供右键“自动解密”以 WindowStyle=0 (SW_HIDE) 完全无弹窗静默调用同目录下的 dot.lnk
+pub fn vbs_shim_script_content() -> &'static str {
+    concat!(
+        "Option Explicit\r\n",
+        "Dim fso, dir, lnk, i, arg, args, sh, cmd, code, workDir\r\n",
+        "Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n",
+        "dir = fso.GetParentFolderName(WScript.ScriptFullName)\r\n",
+        "lnk = fso.BuildPath(dir, \"dot.lnk\")\r\n",
+        "args = \"\"\r\n",
+        "workDir = \"\"\r\n",
+        "For i = 0 To WScript.Arguments.Count - 1\r\n",
+        "    arg = WScript.Arguments(i)\r\n",
+        "    If Right(arg, 1) = \"\\\" Then\r\n",
+        "        arg = arg & \".\"\r\n",
+        "    End If\r\n",
+        "    If workDir = \"\" And Left(arg, 1) <> \"-\" Then\r\n",
+        "        If fso.FolderExists(arg) Then\r\n",
+        "            workDir = arg\r\n",
+        "        ElseIf fso.FileExists(arg) Then\r\n",
+        "            workDir = fso.GetParentFolderName(arg)\r\n",
+        "        End If\r\n",
+        "    End If\r\n",
+        "    args = args & \" \"\"\" & Replace(arg, \"\"\"\", \"\"\"\"\"\") & \"\"\"\"\r\n",
+        "Next\r\n",
+        "Set sh = CreateObject(\"WScript.Shell\")\r\n",
+        "If workDir <> \"\" Then\r\n",
+        "    On Error Resume Next\r\n",
+        "    sh.CurrentDirectory = workDir\r\n",
+        "    On Error GoTo 0\r\n",
+        "End If\r\n",
+        "cmd = \"cmd.exe /d /s /c \"\"\"\"\" & lnk & \"\"\"\" & args & \"\"\"\"\r\n",
+        "code = sh.Run(cmd, 0, True)\r\n",
+        "WScript.Quit code\r\n",
+    )
 }
 
 /// 在 PATH 字符串中追加目录（若已存在则不重复添加，忽略大小写及末尾斜杠）
@@ -183,57 +228,89 @@ fn normalize_path_entry(entry: &str) -> String {
         .to_string()
 }
 
-/// 执行完整安装流程：
-/// 1. 写入安装目录下的 python.exe 与 uninstall.exe
-/// 2. 在开始菜单目录下创建 dot.lnk 快捷方式及隐藏的 dot.cmd 转发脚本
-/// 3. 将开始菜单目录注入 PATH 环境变量（不暴露 python.exe）
-/// 4. 将“自动解密”注入文件、文件夹、文件夹背景右键菜单（统一调用 dot.lnk）
-/// 5. 写入卸载注册表信息并广播环境变更
 #[cfg(windows)]
 pub fn install(
     cfg: &InstallConfig,
     python_exe_bytes: &[u8],
     uninstall_exe_bytes: &[u8],
 ) -> Result<()> {
+    install_with_progress(cfg, python_exe_bytes, uninstall_exe_bytes, |_, _| {})
+}
+
+/// 执行完整安装流程，支持向 GUI 向导实时回调安装进度 (0..=100) 与状态日志
+#[cfg(windows)]
+pub fn install_with_progress<F>(
+    cfg: &InstallConfig,
+    python_exe_bytes: &[u8],
+    uninstall_exe_bytes: &[u8],
+    mut on_progress: F,
+) -> Result<()>
+where
+    F: FnMut(u32, &str),
+{
+    on_progress(
+        10,
+        &format!("正在创建安装目录: {}", cfg.install_dir.display()),
+    );
     fs::create_dir_all(&cfg.install_dir)
         .with_context(|| format!("创建安装目录失败: {}", cfg.install_dir.display()))?;
 
     let py_path = cfg.python_exe_path();
+    on_progress(25, &format!("正在释放核心程序: {}", py_path.display()));
     write_executable(&py_path, python_exe_bytes)
         .with_context(|| format!("写入核心程序失败: {}", py_path.display()))?;
 
     let uninst_path = cfg.uninstall_exe_path();
+    on_progress(40, &format!("正在释放卸载程序: {}", uninst_path.display()));
     write_executable(&uninst_path, uninstall_exe_bytes)
         .with_context(|| format!("写入卸载程序失败: {}", uninst_path.display()))?;
 
+    on_progress(
+        55,
+        &format!("正在创建开始菜单目录: {}", cfg.start_menu_dir.display()),
+    );
     fs::create_dir_all(&cfg.start_menu_dir)
         .with_context(|| format!("创建开始菜单目录失败: {}", cfg.start_menu_dir.display()))?;
 
     let shortcut = cfg.shortcut_path();
+    on_progress(65, &format!("正在创建开始菜单快捷方式: {}", shortcut.display()));
     create_shortcut(&shortcut, &py_path, "自动解密工具 (dot)")
         .with_context(|| format!("创建开始菜单快捷方式失败: {}", shortcut.display()))?;
 
     let shim = cfg.cmd_shim_path();
-    write_hidden_shim(&shim)
+    write_hidden_text_file(&shim, shim_script_content().as_bytes())
         .with_context(|| format!("写入命令行入口脚本失败: {}", shim.display()))?;
 
-    register_path_environment(cfg).context("注入 PATH 环境变量失败")?;
-    register_context_menu(cfg).context("注入右键菜单“自动解密”失败")?;
+    let vbs_shim = cfg.vbs_shim_path();
+    write_hidden_text_file(&vbs_shim, vbs_shim_script_content().as_bytes())
+        .with_context(|| format!("写入右键静默启动脚本失败: {}", vbs_shim.display()))?;
+
+    if cfg.enable_path_env {
+        on_progress(
+            78,
+            &format!("正在将快捷方式目录注入系统 PATH: {}", cfg.start_menu_dir.display()),
+        );
+        register_path_environment(cfg).context("注入 PATH 环境变量失败")?;
+    }
+
+    if cfg.enable_context_menu {
+        on_progress(88, "正在注册资源管理器右键菜单: 自动解密（无弹窗静默模式）");
+        register_context_menu(cfg).context("注入右键菜单“自动解密”失败")?;
+    }
+
+    on_progress(95, "正在写入 Windows 应用卸载注册表项...");
     register_uninstaller(cfg).context("写入系统卸载注册表项失败")?;
 
     if cfg.broadcast_changes {
+        on_progress(98, "正在通知系统刷新环境变量与资源管理器...");
         broadcast_environment_change();
     }
 
+    on_progress(100, "安装完成！");
     Ok(())
 }
 
-/// 执行完整卸载流程：
-/// 1. 移除文件、文件夹、文件夹背景的“自动解密”右键菜单注册表项
-/// 2. 从 PATH 环境变量中移除开始菜单快捷方式目录
-/// 3. 移除系统卸载注册表项
-/// 4. 删除开始菜单中的 dot.lnk 及目录
-/// 5. 删除安装目录下的 python.exe 与 uninstall.exe（若正在运行则延迟自删）
+/// 执行完整卸载流程
 #[cfg(windows)]
 pub fn uninstall(cfg: &InstallConfig) -> Result<()> {
     unregister_context_menu(cfg).context("移除右键菜单注册表项失败")?;
@@ -241,10 +318,11 @@ pub fn uninstall(cfg: &InstallConfig) -> Result<()> {
     unregister_uninstaller(cfg).context("移除卸载注册表项失败")?;
 
     if cfg.start_menu_dir.exists() {
-        let shim = cfg.cmd_shim_path();
-        if shim.exists() {
-            let _ = win::clear_hidden_and_readonly(&shim);
-            let _ = fs::remove_file(&shim);
+        for hidden_file in [cfg.cmd_shim_path(), cfg.vbs_shim_path(), cfg.shortcut_path()] {
+            if hidden_file.exists() {
+                let _ = win::clear_hidden_and_readonly(&hidden_file);
+                let _ = fs::remove_file(&hidden_file);
+            }
         }
         let _ = fs::remove_dir_all(&cfg.start_menu_dir);
     }
@@ -285,13 +363,13 @@ fn write_executable(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn write_hidden_shim(shim_path: &Path) -> Result<()> {
-    if shim_path.exists() {
-        let _ = win::clear_hidden_and_readonly(shim_path);
-        let _ = fs::remove_file(shim_path);
+fn write_hidden_text_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if path.exists() {
+        let _ = win::clear_hidden_and_readonly(path);
+        let _ = fs::remove_file(path);
     }
-    fs::write(shim_path, shim_script_content().as_bytes())?;
-    win::set_file_hidden(shim_path)?;
+    fs::write(path, bytes)?;
+    win::set_file_hidden(path)?;
     Ok(())
 }
 
@@ -354,9 +432,10 @@ fn unregister_path_environment(cfg: &InstallConfig) -> Result<()> {
 fn register_context_menu(cfg: &InstallConfig) -> Result<()> {
     let hive = cfg.registry_hive.raw_handle();
     let shortcut = cfg.shortcut_path();
+    let vbs_shim = cfg.vbs_shim_path();
     let icon_val = shortcut.to_string_lossy().into_owned();
-    let file_cmd = file_context_command(&shortcut);
-    let dir_cmd = directory_context_command(&shortcut);
+    let file_cmd = file_context_command(&vbs_shim);
+    let dir_cmd = directory_context_command(&vbs_shim);
 
     let targets = [
         (
@@ -510,16 +589,6 @@ pub fn enable_utf8_console() {
     win::enable_utf8_console();
 }
 
-pub fn wait_for_enter_if_interactive(quiet: bool) {
-    if quiet {
-        return;
-    }
-    print!("\n按回车键退出...");
-    let _ = io::stdout().flush();
-    let mut buf = String::new();
-    let _ = io::stdin().read_line(&mut buf);
-}
-
 #[cfg(windows)]
 pub mod win {
     use super::*;
@@ -558,6 +627,13 @@ pub mod win {
 
     const COINIT_APARTMENTTHREADED: u32 = 0x2;
     const CLSCTX_INPROC_SERVER: u32 = 0x1;
+
+    pub const MB_OK: u32 = 0x0000_0000;
+    pub const MB_YESNO: u32 = 0x0000_0004;
+    pub const MB_ICONHAND: u32 = 0x0000_0010;
+    pub const MB_ICONQUESTION: u32 = 0x0000_0020;
+    pub const MB_ICONINFORMATION: u32 = 0x0000_0040;
+    pub const IDYES: i32 = 6;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -733,11 +809,17 @@ pub mod win {
             uTimeout: u32,
             lpdwResult: *mut usize,
         ) -> isize;
+        pub fn MessageBoxW(
+            hWnd: isize,
+            lpText: *const u16,
+            lpCaption: *const u16,
+            uType: u32,
+        ) -> i32;
     }
 
     #[link(name = "ole32")]
     unsafe extern "system" {
-        fn CoInitializeEx(pvReserved: *const c_void, dwCoInit: u32) -> i32;
+        pub fn CoInitializeEx(pvReserved: *const c_void, dwCoInit: u32) -> i32;
         fn CoCreateInstance(
             rclsid: *const GUID,
             pUnkOuter: *mut c_void,
@@ -745,7 +827,7 @@ pub mod win {
             riid: *const GUID,
             ppv: *mut *mut c_void,
         ) -> i32;
-        fn CoUninitialize();
+        pub fn CoUninitialize();
     }
 
     pub struct RegKeyGuard(pub isize);
@@ -770,6 +852,12 @@ pub mod win {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect()
+    }
+
+    pub fn message_box(hwnd: isize, text: &str, caption: &str, flags: u32) -> i32 {
+        let t = to_wide(text);
+        let c = to_wide(caption);
+        unsafe { MessageBoxW(hwnd, t.as_ptr(), c.as_ptr(), flags) }
     }
 
     pub fn enable_utf8_console() {
@@ -803,7 +891,7 @@ pub mod win {
             lp_class: null(),
             hkey_class: 0,
             dw_hot_key: 0,
-            h_icon_or_monitor: 0,
+            h_icon_or_monitor: isize::default(),
             h_process: null_mut(),
         };
 
@@ -1128,7 +1216,6 @@ mod tests {
             r"C:\Windows\system32;C:\Windows;C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Dot"
         );
 
-        // 大小写不同或带斜杠时不重复添加
         let (dup, changed2) = add_dir_to_path_string(
             &format!("{added}\\"),
             Path::new(r"c:\programdata\microsoft\windows\start menu\programs\dot"),
@@ -1136,7 +1223,6 @@ mod tests {
         assert!(!changed2);
         assert!(dup.starts_with(&added));
 
-        // 卸载时准确移除
         let (removed, was_removed) = remove_dir_from_path_string(&added, start_menu);
         assert!(was_removed);
         assert_eq!(removed, initial);
@@ -1154,19 +1240,25 @@ mod tests {
     }
 
     #[test]
-    fn context_commands_use_shortcut_and_never_expose_python_exe() {
-        let shortcut =
-            Path::new(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Dot\dot.lnk");
-        let file_cmd = file_context_command(shortcut);
-        let dir_cmd = directory_context_command(shortcut);
+    fn context_commands_use_windowless_vbs_and_never_expose_python_exe() {
+        let vbs_shim =
+            Path::new(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Dot\dot.vbs");
+        let file_cmd = file_context_command(vbs_shim);
+        let dir_cmd = directory_context_command(vbs_shim);
 
-        assert!(file_cmd.contains("dot.lnk"));
+        assert!(file_cmd.starts_with("wscript.exe //B //NoLogo"));
+        assert!(file_cmd.contains("dot.vbs"));
         assert!(!file_cmd.to_ascii_lowercase().contains("python.exe"));
         assert!(file_cmd.contains("\"%1\""));
 
-        assert!(dir_cmd.contains("dot.lnk"));
+        assert!(dir_cmd.starts_with("wscript.exe //B //NoLogo"));
+        assert!(dir_cmd.contains("dot.vbs"));
         assert!(!dir_cmd.to_ascii_lowercase().contains("python.exe"));
         assert!(dir_cmd.contains("-r"));
-        assert!(dir_cmd.contains("\"%V\\.\""));
+        assert!(dir_cmd.contains("\"%V\""));
+
+        assert!(vbs_shim_script_content().contains("dot.lnk"));
+        assert!(vbs_shim_script_content().contains("sh.Run(cmd, 0, True)"));
+        assert!(!vbs_shim_script_content().to_ascii_lowercase().contains("python.exe"));
     }
 }

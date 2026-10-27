@@ -34,6 +34,8 @@ fn full_install_cli_dot_context_menu_and_uninstall_workflow() {
         env_subkey: format!(r"{reg_root}\Environment"),
         classes_subkey: format!(r"{reg_root}\Classes"),
         uninstall_subkey: format!(r"{reg_root}\Uninstall\GoodniceDot"),
+        enable_path_env: true,
+        enable_context_menu: true,
         broadcast_changes: false,
     };
 
@@ -55,12 +57,14 @@ fn full_install_cli_dot_context_menu_and_uninstall_workflow() {
     // 1. 执行安装
     install(&cfg, &py_bytes, &uninst_bytes).unwrap();
 
-    // 2. 校验安装目录与开始菜单快捷方式
+    // 2. 校验安装目录与开始菜单快捷方式及隐藏转发器
     assert!(cfg.python_exe_path().is_file());
     assert!(cfg.uninstall_exe_path().is_file());
     assert!(cfg.shortcut_path().is_file());
     assert!(cfg.cmd_shim_path().is_file());
+    assert!(cfg.vbs_shim_path().is_file());
     assert!(win::is_file_hidden(&cfg.cmd_shim_path()));
+    assert!(win::is_file_hidden(&cfg.vbs_shim_path()));
 
     // 3. 校验 PATH 指向开始菜单目录，且未暴露 python.exe 所在安装目录
     let (reg_path, _) = {
@@ -99,7 +103,7 @@ fn full_install_cli_dot_context_menu_and_uninstall_workflow() {
     assert_eq!(fs::read(&cli_file).unwrap(), b"cli-payload-data");
     assert!(!work_dir.join("output").exists());
 
-    // 5. 验证右键菜单注册表项（名为“自动解密”，通过 dot.lnk 调用，不暴露 python.exe）
+    // 5. 验证右键菜单注册表项（名为“自动解密”，通过 wscript.exe 无弹窗静默调用开始菜单目录中的 dot.vbs -> dot.lnk，不暴露 python.exe）
     let file_cmd_reg = query_reg_default(&format!(
         r"{}\*\shell\{}\command",
         cfg.classes_subkey, CONTEXT_MENU_KEY_NAME
@@ -118,11 +122,12 @@ fn full_install_cli_dot_context_menu_and_uninstall_workflow() {
     ));
     assert_eq!(label, CONTEXT_MENU_LABEL);
     for cmd_str in [&file_cmd_reg, &dir_cmd_reg, &bg_cmd_reg] {
-        assert!(cmd_str.contains("dot.lnk"));
+        assert!(cmd_str.starts_with("wscript.exe //B //NoLogo"));
+        assert!(cmd_str.contains("dot.vbs"));
         assert!(!cmd_str.to_ascii_lowercase().contains("python.exe"));
     }
 
-    // 模拟右键单击文件“自动解密”（哪怕 Explorer 当前工作目录在 SystemRoot 下也能正常工作）
+    // 模拟右键单击文件“自动解密”（无弹窗静默运行，哪怕 Explorer 当前工作目录在 SystemRoot 下也能正常工作）
     let ctx_file = work_dir.join("context_file.pdf");
     fs::write(&ctx_file, b"context-single-file").unwrap();
     let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
@@ -131,7 +136,7 @@ fn full_install_cli_dot_context_menu_and_uninstall_workflow() {
     assert_eq!(fs::read(&ctx_file).unwrap(), b"context-single-file");
     assert!(!work_dir.join("output").exists());
 
-    // 模拟右键文件夹空白处“自动解密”（递归处理子目录）
+    // 模拟右键文件夹空白处“自动解密”（无弹窗静默递归处理子目录）
     let nested_file = work_dir.join("nested").join("deep.pdf");
     fs::write(&nested_file, b"deep-nested-bytes").unwrap();
     let bg_invocation = bg_cmd_reg.replace("%V", &work_dir.to_string_lossy());
@@ -175,11 +180,10 @@ fn query_reg_default(subkey: &str) -> String {
 
 fn run_shell_command_string(full_cmd: &str, cwd: &Path) {
     use std::os::windows::process::CommandExt;
-    // Windows Explorer 直接将注册表中的命令行原样传给 CreateProcessW，不会做 Rust args 的 \" 转义
     let raw_tail = full_cmd
-        .strip_prefix("cmd.exe ")
-        .expect("command starts with cmd.exe ");
-    let out = Command::new("cmd.exe")
+        .strip_prefix("wscript.exe ")
+        .expect("command starts with wscript.exe ");
+    let out = Command::new("wscript.exe")
         .current_dir(cwd)
         .raw_arg(raw_tail)
         .output()
