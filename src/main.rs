@@ -10,13 +10,15 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 
 use cli::Cli;
 use discover::{DiscoverOptions, collect_files};
 use pathutil::{absolute, normalize_ext, same_path, strip_prefix_ci};
-use process::{FileOutcome, ProcessConfig, planned_dest, process_file};
+use process::{
+    FileOutcome, ProcessConfig, cleanup_output_dir, planned_dest, process_file, validate_output_dir,
+};
 
 fn main() -> ExitCode {
     enable_windows_utf8();
@@ -36,7 +38,7 @@ fn run() -> Result<ExitCode> {
         bail!("请指定至少一个文件或目录");
     }
 
-    let output_dir = absolute(&cli.output).unwrap_or_else(|_| cli.output.clone());
+    let output_dir = resolve_output_dir(&cli, &paths);
     let extensions: Vec<String> = cli.extension.iter().map(|e| normalize_ext(e)).collect();
 
     let powershell = if cli.dry_run {
@@ -110,6 +112,10 @@ fn run() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // 先检查全部任务，避免处理到一半才发现源文件位于输出目录内。
+    for job in &jobs {
+        validate_output_dir(&job.source, &output_dir)?;
+    }
     warn_destination_collisions(&jobs);
 
     if cli.verbose || cli.dry_run {
@@ -123,6 +129,7 @@ fn run() -> Result<ExitCode> {
 
     let mut ok = 0usize;
     let mut fail = 0usize;
+    let mut failed_outputs = Vec::new();
     let total = jobs.len();
 
     for (i, job) in jobs.iter().enumerate() {
@@ -143,13 +150,25 @@ fn run() -> Result<ExitCode> {
             dry_run: cli.dry_run,
         };
 
-        match process_file(&job.source, &cfg) {
+        let result = if failed_outputs
+            .iter()
+            .any(|dest: &PathBuf| same_path(dest, &job.dest))
+        {
+            Err(anyhow!(
+                "输出路径已有失败任务的文件，为保留该文件而跳过: {}",
+                job.dest.display()
+            ))
+        } else {
+            process_file(&job.source, &cfg)
+        };
+        match result {
             Ok(outcome) => {
                 ok += 1;
                 print_success(&outcome, cli.verbose, cli.dry_run);
             }
             Err(err) => {
                 fail += 1;
+                failed_outputs.push(job.dest.clone());
                 if !cli.verbose {
                     println!("失败");
                 }
@@ -159,6 +178,26 @@ fn run() -> Result<ExitCode> {
                 }
             }
         }
+    }
+
+    if cli.dry_run {
+        println!(
+            "[dry-run] 全部成功后删除空输出目录: {}",
+            output_dir.display()
+        );
+    } else if fail == 0 {
+        if cleanup_output_dir(&output_dir)? {
+            if cli.verbose {
+                println!("已删除输出目录: {}", output_dir.display());
+            }
+        } else {
+            eprintln!("输出目录仍有文件或链接，已保留: {}", output_dir.display());
+        }
+    } else {
+        eprintln!(
+            "存在处理失败的文件，已保留输出目录: {}",
+            output_dir.display()
+        );
     }
 
     println!();
@@ -182,7 +221,7 @@ struct Job {
 
 fn resolve_paths(cli: &Cli) -> Result<Vec<PathBuf>> {
     if !cli.paths.is_empty() {
-        return Ok(cli.paths.clone());
+        return Ok(cli.paths.iter().map(|p| pathutil::normalize(p)).collect());
     }
     eprint!("请输入文件或目录路径: ");
     io::stderr().flush().ok();
@@ -190,11 +229,43 @@ fn resolve_paths(cli: &Cli) -> Result<Vec<PathBuf>> {
     io::stdin()
         .read_line(&mut line)
         .context("读取交互输入失败")?;
-    let line = line.trim();
+    let line = line.trim().trim_matches('"').trim_matches('\'').trim();
     if line.is_empty() {
         bail!("未输入路径");
     }
-    Ok(vec![PathBuf::from(line)])
+    Ok(vec![pathutil::normalize(Path::new(line))])
+}
+
+fn resolve_output_dir(cli: &Cli, paths: &[PathBuf]) -> PathBuf {
+    if cli.output == Path::new("output")
+        && let Some(first) = paths.first()
+        && should_relocate_default_output()
+    {
+        let first_abs = absolute(first).unwrap_or_else(|_| first.clone());
+        let base = if first_abs.is_dir() {
+            first_abs
+        } else {
+            first_abs
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or(first_abs)
+        };
+        return base.join("output");
+    }
+    absolute(&cli.output).unwrap_or_else(|_| cli.output.clone())
+}
+
+fn should_relocate_default_output() -> bool {
+    let Ok(cwd) = std::env::current_dir() else {
+        return true;
+    };
+    if let Some(sys_root) = std::env::var_os("SystemRoot") {
+        let sys_path = PathBuf::from(sys_root);
+        if pathutil::is_within(&cwd, &sys_path) {
+            return true;
+        }
+    }
+    false
 }
 
 fn display_source(source: &Path, input_root: Option<&Path>) -> String {
@@ -211,7 +282,11 @@ fn display_source(source: &Path, input_root: Option<&Path>) -> String {
 }
 
 fn print_success(outcome: &FileOutcome, verbose: bool, dry_run: bool) {
-    let tag = if dry_run { "将写入" } else { "完成" };
+    let tag = if dry_run {
+        "将替换源文件"
+    } else {
+        "完成"
+    };
     if verbose {
         println!(
             "    {tag}: {} ({} 字节)",

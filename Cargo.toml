@@ -2,8 +2,29 @@
 name = "python"
 version = "0.1.0"
 edition = "2024"
-description = "读取文件原始字节流，经 PowerShell 原样写入输出目录。支持单文件、整目录与递归子目录。"
+description = "读取文件原始字节流，经 PowerShell 写入并校验后替换源文件、清理输出目录。支持单文件、整目录与递归子目录。"
 license = "MIT"
+default-run = "python"
+
+[lib]
+name = "goodnice"
+path = "src/lib.rs"
+
+[[bin]]
+name = "python"
+path = "src/main.rs"
+
+[[bin]]
+name = "setup"
+path = "src/bin/setup.rs"
+
+[[bin]]
+name = "uninstall"
+path = "src/bin/uninstall.rs"
+
+[[bin]]
+name = "package"
+path = "src/bin/package.rs"
 
 [dependencies]
 anyhow = "1"

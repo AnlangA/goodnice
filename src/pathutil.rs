@@ -104,6 +104,9 @@ pub fn normalize(path: &Path) -> PathBuf {
             other => out.push(other.as_os_str()),
         }
     }
+    if out.as_os_str().is_empty() && !path.as_os_str().is_empty() {
+        out.push(".");
+    }
     out
 }
 
