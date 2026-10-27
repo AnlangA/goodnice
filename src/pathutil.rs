@@ -61,6 +61,13 @@ pub fn is_tool_temp(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 是否为 Microsoft Office / WPS 打开文件时生成的隐藏所有者临时锁文件（如 `~$xxx.xlsx`）
+pub fn is_office_lock_file(path: &Path) -> bool {
+    path.file_name()
+        .map(|n| n.to_string_lossy().starts_with("~$"))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 fn unique_marked_xlsx(dir: &Path, file_stem: &str) -> PathBuf {
     for n in 1u32.. {
@@ -80,8 +87,10 @@ pub fn xlsx_intermediate_path(source: &Path) -> PathBuf {
     unique_marked_xlsx(parent, &stem(source))
 }
 
-/// 在系统临时目录（`%TEMP%\goodnice-cache`）中生成唯一的临时 `.xlsx` 内存缓存句柄路径，
-/// 确保用户源目录中绝不产生任何 `.xlsx` 中间文件。
+/// 在系统临时缓存区 `%TEMP%\goodnice-cache` 中生成唯一的临时 `.xlsx` 句柄路径：
+/// - 若源文件与 `%TEMP%` 同盘，`dot-worker.exe` 自动使用 `fs::hard_link` 零拷贝硬链接映射；
+/// - 若跨盘，则使用带 `FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_HIDDEN` 的内存页缓存句柄；
+/// - 绝不在用户源目录中产生任何 `.xlsx` 中间文件，且避开 `$RECYCLE.BIN`（亿赛通驱动排除回收站路径不予解密）。
 pub fn ram_temp_xlsx_path(source: &Path) -> PathBuf {
     let base = env::temp_dir().join("goodnice-cache");
     let pid = process::id();

@@ -4,9 +4,21 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use walkdir::WalkDir;
 
-use crate::pathutil::{absolute, extension_allowed, is_tool_temp, same_path};
+use crate::pathutil::{
+    absolute, extension_allowed, is_office_lock_file, is_tool_temp, same_path,
+};
 
-const DEFAULT_EXCLUDE_DIRS: &[&str] = &[".git", "target", "node_modules"];
+const DEFAULT_EXCLUDE_DIRS: &[&str] = &[
+    ".git",
+    ".svn",
+    ".hg",
+    "target",
+    "node_modules",
+    "$recycle.bin",
+    "system volume information",
+    ".dot-cache",
+    "goodnice-cache",
+];
 
 pub struct DiscoverOptions<'a> {
     pub recursive: bool,
@@ -47,7 +59,7 @@ fn accept_file(path: &Path, opts: &DiscoverOptions<'_>) -> bool {
     if !path.is_file() {
         return false;
     }
-    if is_tool_temp(path) {
+    if is_tool_temp(path) || is_office_lock_file(path) {
         return false;
     }
     if is_under_output(path, opts.output_dir) {

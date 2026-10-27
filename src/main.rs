@@ -1,9 +1,3 @@
-mod cli;
-mod discover;
-mod pathutil;
-mod powershell;
-mod process;
-
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -13,16 +7,25 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 
-use cli::Cli;
-use discover::{DiscoverOptions, collect_files};
-use pathutil::{absolute, normalize_ext, same_path, strip_prefix_ci};
-use powershell::PowerShellSession;
-use process::{
+use goodnice::cli::Cli;
+use goodnice::discover::{DiscoverOptions, collect_files};
+use goodnice::pathutil::{
+    self, absolute, is_office_lock_file, normalize_ext, same_path, strip_prefix_ci,
+};
+use goodnice::process::{
     FileOutcome, ProcessConfig, cleanup_output_dir, planned_dest, process_file_with_session,
     validate_output_dir,
 };
+use goodnice::worker::{self, WORKER_ARG, WorkerSession};
 
 fn main() -> ExitCode {
+    if std::env::args_os().any(|a| a == WORKER_ARG) {
+        return match worker::run_worker_server() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::from(1),
+        };
+    }
+
     enable_windows_utf8();
     match run() {
         Ok(code) => code,
@@ -35,6 +38,11 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
+    if cli.internal_io_worker {
+        worker::run_worker_server()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let paths = resolve_paths(&cli)?;
     if paths.is_empty() {
         bail!("请指定至少一个文件或目录");
@@ -42,6 +50,7 @@ fn run() -> Result<ExitCode> {
 
     let output_dir = resolve_output_dir(&cli, &paths);
     let extensions: Vec<String> = cli.extension.iter().map(|e| normalize_ext(e)).collect();
+    let recursive = cli.is_recursive();
 
     let mut jobs: Vec<Job> = Vec::new();
     for path in &paths {
@@ -50,8 +59,8 @@ fn run() -> Result<ExitCode> {
                 eprintln!("跳过（扩展名不匹配）: {}", path.display());
                 continue;
             }
-            if pathutil::is_tool_temp(path) {
-                eprintln!("跳过（中间临时文件）: {}", path.display());
+            if pathutil::is_tool_temp(path) || is_office_lock_file(path) {
+                eprintln!("跳过（临时或锁文件）: {}", path.display());
                 continue;
             }
             jobs.push(Job {
@@ -74,7 +83,7 @@ fn run() -> Result<ExitCode> {
                 );
             }
             let opts = DiscoverOptions {
-                recursive: cli.recursive,
+                recursive,
                 extensions: &extensions,
                 extra_exclude_dirs: &cli.exclude_dir,
                 output_dir: &output_dir,
@@ -82,12 +91,14 @@ fn run() -> Result<ExitCode> {
             let files = collect_files(path, &opts)?;
             let root = absolute(path).unwrap_or_else(|_| path.clone());
             if files.is_empty() {
-                let scope = if cli.recursive {
+                let scope = if recursive {
                     "（含所有子目录）"
                 } else {
                     "（仅当前目录）"
                 };
-                eprintln!("未找到待处理文件{}: {}", scope, path.display());
+                if !cli.quiet {
+                    eprintln!("未找到待处理文件{}: {}", scope, path.display());
+                }
                 continue;
             }
             for file in files {
@@ -110,21 +121,16 @@ fn run() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // 先检查全部任务，避免处理到一半才发现源文件位于输出目录内。
     for job in &jobs {
         validate_output_dir(&job.source, &output_dir)?;
     }
     warn_destination_collisions(&jobs);
 
-    let mut ps_session = if cli.dry_run {
+    let mut worker_session = if cli.dry_run {
         None
     } else {
-        Some(PowerShellSession::spawn_auto()?)
+        Some(WorkerSession::spawn_auto()?)
     };
-    let powershell_prog = ps_session
-        .as_ref()
-        .map(|s| s.program().clone())
-        .unwrap_or_else(|| OsString::from("powershell.exe"));
 
     if (cli.verbose || cli.dry_run) && !cli.quiet {
         let mode = if cli.dry_run {
@@ -132,10 +138,11 @@ fn run() -> Result<ExitCode> {
         } else {
             "开始处理"
         };
-        println!("{mode} {} 个文件 -> {}", jobs.len(), output_dir.display());
+        println!("{mode} {} 个文件", jobs.len());
     }
 
     let mut ok = 0usize;
+    let mut skipped = 0usize;
     let mut fail = 0usize;
     let mut failed_outputs = Vec::new();
     let total = jobs.len();
@@ -155,7 +162,7 @@ fn run() -> Result<ExitCode> {
         let cfg = ProcessConfig {
             output_dir: output_dir.clone(),
             input_root: job.input_root.clone(),
-            powershell: powershell_prog.clone(),
+            worker_program: OsString::from("auto"),
             verbose: cli.verbose && !cli.quiet,
             dry_run: cli.dry_run,
         };
@@ -169,11 +176,14 @@ fn run() -> Result<ExitCode> {
                 job.dest.display()
             ))
         } else {
-            process_file_with_session(&job.source, &cfg, ps_session.as_mut())
+            process_file_with_session(&job.source, &cfg, worker_session.as_mut())
         };
         match result {
             Ok(outcome) => {
                 ok += 1;
+                if outcome.skipped_unencrypted {
+                    skipped += 1;
+                }
                 if !cli.quiet {
                     print_success(&outcome, cli.verbose, cli.dry_run);
                 }
@@ -216,10 +226,17 @@ fn run() -> Result<ExitCode> {
 
     if !cli.quiet {
         println!();
-        println!(
-            "完成: 成功 {ok}, 失败 {fail}, 合计 {total}{}",
-            if cli.dry_run { " (dry-run)" } else { "" }
-        );
+        if skipped > 0 {
+            println!(
+                "完成: 成功 {ok} (其中未加密快速跳过 {skipped}), 失败 {fail}, 合计 {total}{}",
+                if cli.dry_run { " (dry-run)" } else { "" }
+            );
+        } else {
+            println!(
+                "完成: 成功 {ok}, 失败 {fail}, 合计 {total}{}",
+                if cli.dry_run { " (dry-run)" } else { "" }
+            );
+        }
     }
 
     if fail > 0 {
@@ -300,6 +317,8 @@ fn display_source(source: &Path, input_root: Option<&Path>) -> String {
 fn print_success(outcome: &FileOutcome, verbose: bool, dry_run: bool) {
     let tag = if dry_run {
         "将替换源文件"
+    } else if outcome.skipped_unencrypted {
+        "未加密(已跳过)"
     } else {
         "完成"
     };

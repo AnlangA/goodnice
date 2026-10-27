@@ -6,14 +6,19 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::pathutil::{is_within, is_xlsx, ram_temp_xlsx_path, strip_prefix_ci, suffix};
-use crate::powershell::{self, PowerShellSession};
+use crate::worker::{self, WorkerSession, has_esafenet_magic};
+
+/// 大于此阈值（4096 字节，即亿赛通固定加密头大小）且无亿赛通加密魔数的文件直接零拷贝快速跳过
+const FAST_SKIP_THRESHOLD_BYTES: u64 = 4096;
+/// 最大递归剥离嵌套加密层数（防止损坏文件死循环）
+const MAX_DECRYPT_LAYERS: usize = 8;
 
 pub struct ProcessConfig {
     pub output_dir: PathBuf,
     /// 目录模式：源文件相对此根目录的路径会映射到输出目录，以保留子目录结构。
     /// 单文件模式：为 `None`，输出到 `output_dir / 文件名`。
     pub input_root: Option<PathBuf>,
-    pub powershell: OsString,
+    pub worker_program: OsString,
     pub verbose: bool,
     pub dry_run: bool,
 }
@@ -21,6 +26,8 @@ pub struct ProcessConfig {
 pub struct FileOutcome {
     pub dest: PathBuf,
     pub bytes: u64,
+    pub layers_peeled: usize,
+    pub skipped_unencrypted: bool,
 }
 
 struct DeleteOnDrop {
@@ -64,7 +71,6 @@ pub fn planned_dest(source: &Path, input_root: Option<&Path>, output_dir: &Path)
     }
 }
 
-#[cfg(test)]
 pub fn process_file(source: &Path, cfg: &ProcessConfig) -> Result<FileOutcome> {
     process_file_with_session(source, cfg, None)
 }
@@ -72,7 +78,7 @@ pub fn process_file(source: &Path, cfg: &ProcessConfig) -> Result<FileOutcome> {
 pub fn process_file_with_session(
     source: &Path,
     cfg: &ProcessConfig,
-    mut session: Option<&mut PowerShellSession>,
+    session: Option<&mut WorkerSession>,
 ) -> Result<FileOutcome> {
     if !source.is_file() {
         bail!("文件不存在: {}", source.display());
@@ -80,14 +86,12 @@ pub fn process_file_with_session(
     validate_output_dir(source, &cfg.output_dir)?;
 
     let dest_final = planned_dest(source, cfg.input_root.as_deref(), &cfg.output_dir);
-    let original_suffix = suffix(source);
-    let originally_xlsx = is_xlsx(source);
 
     if cfg.dry_run {
         vlog(
             cfg,
             &format!(
-                "[dry-run] {} -> 内存读取字节流并校验后直接存盘替换 {}",
+                "[dry-run] {} -> 零拷贝硬链接映射 + 内存流式剥壳后存盘替换 {}",
                 source.display(),
                 source.display()
             ),
@@ -95,11 +99,47 @@ pub fn process_file_with_session(
         return Ok(FileOutcome {
             dest: source.to_path_buf(),
             bytes: fs::metadata(source).map(|m| m.len()).unwrap_or(0),
+            layers_peeled: 0,
+            skipped_unencrypted: false,
         });
     }
 
-    // 第 1 步：非 xlsx 文件通过不受加密策略控制的 PowerShell 在系统临时区构建 .xlsx 句柄
-    // （避免在用户源目录产生任何中间文件，同时防止 python.exe 写入 .xlsx 时触发亿赛通二次加密）
+    match session {
+        Some(sess) => execute_with_session(source, &dest_final, cfg, sess),
+        None => worker::with_oneshot_worker(&cfg.worker_program, |sess| {
+            execute_with_session(source, &dest_final, cfg, sess)
+        }),
+    }
+}
+
+fn execute_with_session(
+    source: &Path,
+    dest_final: &Path,
+    cfg: &ProcessConfig,
+    sess: &mut WorkerSession,
+) -> Result<FileOutcome> {
+    let original_suffix = suffix(source);
+    let originally_xlsx = is_xlsx(source);
+
+    let (raw_len, raw_head) = sess.read_raw_head(source)?;
+    let has_magic = has_esafenet_magic(&raw_head);
+
+    // 智能零拷贝快速跳过：对大于 64KB 且无亿赛通加密头魔数（E0-A8-91-E7-D8-F2-05-AC）的文件，
+    // 在构建任何临时句柄之前直接毫秒级跳过，避免对数百 MB 的已解密文件或压缩包产生无效读写。
+    if !has_magic && raw_len > FAST_SKIP_THRESHOLD_BYTES {
+        vlog(
+            cfg,
+            &format!("检测到文件未加密 ({raw_len} 字节)，毫秒级零拷贝跳过"),
+        );
+        return Ok(FileOutcome {
+            dest: source.to_path_buf(),
+            bytes: raw_len,
+            layers_peeled: 0,
+            skipped_unencrypted: true,
+        });
+    }
+
+    // 第 1 步：非 xlsx 文件通过系统临时区（或同盘硬链接）构建 .xlsx 解密视图句柄
     let mut tmp_guard: Option<DeleteOnDrop> = None;
     let read_path = if originally_xlsx {
         vlog(cfg, "已是 xlsx 格式，直接进入内存读取");
@@ -118,30 +158,60 @@ pub fn process_file_with_session(
         );
         let temp_xlsx = ram_temp_xlsx_path(source);
         let guard = DeleteOnDrop::new(temp_xlsx.clone());
-        match session.as_deref_mut() {
-            Some(sess) => {
-                sess.stage_temp_xlsx(source, &temp_xlsx, cfg.verbose)?;
-            }
-            None => {
-                powershell::stage_temp_xlsx_via_powershell(
-                    &cfg.powershell,
-                    source,
-                    &temp_xlsx,
-                    cfg.verbose,
-                )?;
-            }
-        }
+        let used_hardlink = sess.stage_temp_xlsx(source, &temp_xlsx)?;
+        vlog(
+            cfg,
+            &format!(
+                "已构建 .xlsx 解密句柄 ({}): {}",
+                if used_hardlink {
+                    "零拷贝同卷硬链接"
+                } else {
+                    "系统临时区缓存"
+                },
+                temp_xlsx.display()
+            ),
+        );
         tmp_guard = Some(guard);
         temp_xlsx
     };
 
-    // 第 2 步：由具备亿赛通表格解密权限的 python.exe 将字节流读入内存（触发透明解密），并立即清理系统临时区句柄
+    // 第 2 步：由具备亿赛通表格解密权限的 python.exe 将字节流读入内存（支持多层嵌套加密递归剥壳）
     vlog(cfg, &format!("读取解密字节流至内存: {}", read_path.display()));
-    let data =
+    let mut data =
         fs::read(&read_path).with_context(|| format!("读取失败: {}", read_path.display()))?;
-    vlog(cfg, &format!("内存已缓存 {} 字节", data.len()));
+    let mut layers_peeled = usize::from(has_magic || data.len() as u64 != raw_len);
 
-    if let Some(guard) = tmp_guard.as_mut() {
+    // 若解密后的数据仍然带有亿赛通加密魔数（说明此前曾被多层嵌套加密），则在内存中自动递归剥离
+    while has_esafenet_magic(&data) && layers_peeled < MAX_DECRYPT_LAYERS {
+        let peel_xlsx = match &tmp_guard {
+            Some(g) => g.path.clone(),
+            None => {
+                let p = ram_temp_xlsx_path(source);
+                tmp_guard = Some(DeleteOnDrop::new(p.clone()));
+                p
+            }
+        };
+        vlog(
+            cfg,
+            &format!(
+                "检测到嵌套加密层 (第 {} 层)，继续递归剥离...",
+                layers_peeled + 1
+            ),
+        );
+        sess.stage_temp_bytes(&peel_xlsx, &data)?;
+        let next_data = fs::read(&peel_xlsx)
+            .with_context(|| format!("读取嵌套解密层失败: {}", peel_xlsx.display()))?;
+        if next_data == data {
+            break;
+        }
+        data = next_data;
+        layers_peeled += 1;
+    }
+
+    vlog(cfg, &format!("内存已缓存明文 {} 字节", data.len()));
+
+    // 读取完成瞬间立即清理临时 .xlsx 句柄
+    if let Some(mut guard) = tmp_guard.take() {
         remove_file_best_effort(&guard.path)
             .with_context(|| format!("删除临时文件失败: {}", guard.path.display()))?;
         if let Some(parent) = guard.path.parent() {
@@ -154,38 +224,27 @@ pub fn process_file_with_session(
         guard.disarm();
     }
 
-    // 第 3 步：将内存中的解密字节流通过管道传给 PowerShell 校验并直接存盘至原路径
+    // 第 3 步：通过原生二进制管道交给 dot-worker.exe 校验并直接存盘至原路径
     let dest_dir = dest_final
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    match session {
-        Some(sess) => {
-            sess.write_final_file(&data, source, &dest_dir, &dest_final, cfg.verbose)?;
-        }
-        None => {
-            powershell::write_bytes_via_powershell(
-                &cfg.powershell,
-                &data,
-                source,
-                &dest_dir,
-                &dest_final,
-                cfg.verbose,
-            )?;
-        }
-    }
+    sess.write_final_file(&data, source, &dest_dir, dest_final)?;
     vlog(
         cfg,
         &format!(
-            "验证通过并已将最终文件存盘: {} (由 PowerShell 内存校验)",
-            source.display()
+            "验证通过并已将最终文件存盘: {} ({} 字节)",
+            source.display(),
+            data.len()
         ),
     );
 
     Ok(FileOutcome {
         dest: source.to_path_buf(),
         bytes: data.len() as u64,
+        layers_peeled,
+        skipped_unencrypted: false,
     })
 }
 
@@ -254,7 +313,7 @@ mod tests {
         ProcessConfig {
             output_dir,
             input_root: None,
-            powershell: OsString::from("goodnice-missing-powershell"),
+            worker_program: OsString::from("goodnice-missing-worker-binary"),
             verbose: false,
             dry_run,
         }
@@ -277,21 +336,16 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn stage_temp_xlsx_marks_temporary_and_hidden_in_system_temp() {
-        use std::os::windows::fs::MetadataExt;
+    fn stage_temp_xlsx_uses_zero_copy_hardlink_or_isolated_temp() {
         let dir = tempdir().unwrap();
         let src = dir.path().join("a.pdf");
         fs::write(&src, b"in-memory-cache-payload").unwrap();
 
         let dst = ram_temp_xlsx_path(&src);
         assert_ne!(dst.parent(), Some(dir.path()));
-        let mut sess = PowerShellSession::spawn_auto().unwrap();
-        sess.stage_temp_xlsx(&src, &dst, false).unwrap();
-
-        let attrs = fs::metadata(&dst).unwrap().file_attributes();
-        // FILE_ATTRIBUTE_TEMPORARY (0x100) | FILE_ATTRIBUTE_HIDDEN (0x2)
-        assert_ne!(attrs & 0x0000_0100, 0, "应带有 FILE_ATTRIBUTE_TEMPORARY 标志");
-        assert_ne!(attrs & 0x0000_0002, 0, "应带有 FILE_ATTRIBUTE_HIDDEN 标志");
+        let mut sess = WorkerSession::spawn_auto().unwrap();
+        let _used_hardlink = sess.stage_temp_xlsx(&src, &dst).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), b"in-memory-cache-payload");
         cleanup_temp_xlsx(&dst);
     }
 
@@ -349,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_powershell_keeps_source_and_cleans_intermediate() {
+    fn failed_worker_keeps_source_and_cleans_intermediate() {
         let dir = tempdir().unwrap();
         let source = dir.path().join("a.pdf");
         let output = dir.path().join("output");

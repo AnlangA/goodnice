@@ -2,7 +2,7 @@
 name = "python"
 version = "0.1.0"
 edition = "2024"
-description = "读取文件原始字节流，经 PowerShell 写入并校验后替换源文件、清理输出目录。支持单文件、整目录与递归子目录。"
+description = "高速透明解密工具：零拷贝硬链接映射、内存流式剥壳、原生二进制管道校验落盘与默认递归目录解密。"
 license = "MIT"
 default-run = "python"
 
@@ -28,7 +28,6 @@ path = "src/bin/package.rs"
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
 clap = { version = "4", features = ["derive", "wrap_help", "unicode"] }
 walkdir = "2"
 

@@ -2,16 +2,15 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-/// 将文件解密字节流读入内存，经 PowerShell 内存校验后直接将最终文件存盘替换源文件。
+/// 高速透明解密工具：零拷贝硬链接映射 + 内存流式剥离加密壳 + 原生二进制管道校验落盘。
 ///
-/// 处理流程：
-///   1. 非 xlsx 文件创建内核内存缓存临时句柄（`FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_HIDDEN`），不主动刷盘；
-///   2. 将字节流读入内存，通过管道交给常驻 PowerShell 在内存中解码并计算 MD5；
-///   3. 处理完成后直接将最终文件存盘至原路径并完成读写一致性校验；
-///   4. 立即清理临时 `.xlsx` 缓存句柄。
+/// 核心架构：
+///   1. 零拷贝硬链接映射：非 .xlsx 文件优先通过同卷隐藏区 NTFS 硬链接瞬间映射为 .xlsx 句柄（0 字节拷贝）；
+///   2. 智能快速跳过：对未加密大文件毫秒级识别并直接跳过，避免无效 I/O；
+///   3. 内存递归剥壳：由具备亿赛通表格解密权限的 python.exe 将字节流读入内存，若存在多层嵌套加密则自动递归剥离；
+///   4. 原生二进制管道落盘：通过独立进程名的原生工作进程（dot-worker.exe）完成校验并一次性落盘。
 ///
-/// PATH 为文件时处理该文件；为目录时处理该目录下的文件。
-/// 加上 `-r/--recursive` 后，会继续递归处理所有子目录中的文件。
+/// PATH 为文件时解密该文件；为目录时默认递归解密该目录及其所有子目录中的文件。
 #[derive(Parser, Debug)]
 #[command(
     name = "dot",
@@ -19,12 +18,11 @@ use clap::Parser;
     about,
     long_about = None,
     after_help = "示例:\n  \
-        dot file.pdf                 处理单个文件\n  \
-        dot ./docs                   处理目录中的文件（不进入子目录）\n  \
-        dot ./docs -r                递归处理目录及所有子目录中的文件\n  \
-        dot ./docs -r -e pdf -e xlsx 仅处理 pdf 与 xlsx\n  \
-        dot a.pdf b.pdf ./docs -o out\n  \
-        dot ./docs -r --dry-run      预览将要处理的文件\n",
+        dot file.pptx                解密单个文件\n  \
+        dot ./docs                   默认递归解密目录及所有子目录中的文件\n  \
+        dot ./docs --no-recursive    仅解密当前目录顶层文件（不进入子目录）\n  \
+        dot ./docs -e pdf -e xlsx    仅处理 pdf 与 xlsx\n  \
+        dot ./docs --dry-run         预览将要处理的文件\n",
     next_line_help = true
 )]
 pub struct Cli {
@@ -32,11 +30,15 @@ pub struct Cli {
     #[arg(value_name = "PATH")]
     pub paths: Vec<PathBuf>,
 
-    /// 递归处理目录下所有子目录中的文件（仅对目录生效）
+    /// 递归处理目录下所有子目录中的文件（默认对目录已开启递归，保留此参数兼容旧命令）
     #[arg(short, long)]
     pub recursive: bool,
 
-    /// 临时输出目录，成功后移回源目录并清理空目录（默认：output/）
+    /// 仅处理目录顶层文件，不递归进入子目录
+    #[arg(long = "no-recursive")]
+    pub no_recursive: bool,
+
+    /// 回退输出目录（仅当源文件被外部程序锁死无法替换时使用，默认：output/）
     #[arg(short, long, value_name = "DIR", default_value = "output")]
     pub output: PathBuf,
 
@@ -44,7 +46,7 @@ pub struct Cli {
     #[arg(short, long, value_name = "EXT", action = clap::ArgAction::Append)]
     pub extension: Vec<String>,
 
-    /// 额外跳过的目录名，可重复。默认已跳过 .git、target、node_modules
+    /// 额外跳过的目录名，可重复。默认已跳过 .git、target、node_modules 等
     #[arg(long = "exclude-dir", value_name = "NAME", action = clap::ArgAction::Append)]
     pub exclude_dir: Vec<String>,
 
@@ -63,4 +65,15 @@ pub struct Cli {
     /// 静默模式，不输出常规进度日志（供右键静默解密或脚本调用）
     #[arg(short, long)]
     pub quiet: bool,
+
+    /// 内部原生 I/O 工作进程模式（隐藏参数）
+    #[arg(long = "internal-io-worker", hide = true)]
+    pub internal_io_worker: bool,
+}
+
+impl Cli {
+    /// 目录是否启用递归遍历（默认开启，除非显式传入 `--no-recursive`）
+    pub fn is_recursive(&self) -> bool {
+        !self.no_recursive
+    }
 }
