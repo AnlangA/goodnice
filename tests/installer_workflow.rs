@@ -57,14 +57,18 @@ fn full_install_cli_dot_context_menu_and_uninstall_workflow() {
     // 1. 执行安装
     install(&cfg, &py_bytes, &uninst_bytes).unwrap();
 
-    // 2. 校验安装目录与开始菜单快捷方式及隐藏转发器
+    // 2. 校验安装目录与开始菜单快捷方式、隐藏转发器及解锁图标 (dot.ico)
     assert!(cfg.python_exe_path().is_file());
     assert!(cfg.uninstall_exe_path().is_file());
     assert!(cfg.shortcut_path().is_file());
     assert!(cfg.cmd_shim_path().is_file());
     assert!(cfg.vbs_shim_path().is_file());
+    assert!(cfg.icon_path().is_file());
     assert!(win::is_file_hidden(&cfg.cmd_shim_path()));
     assert!(win::is_file_hidden(&cfg.vbs_shim_path()));
+    assert!(win::is_file_hidden(&cfg.icon_path()));
+    let ico_data = fs::read(cfg.icon_path()).unwrap();
+    assert_eq!(&ico_data[0..4], &[0, 0, 1, 0]);
 
     // 3. 校验 PATH 指向开始菜单目录，且未暴露 python.exe 所在安装目录
     let (reg_path, _) = {
@@ -120,7 +124,13 @@ fn full_install_cli_dot_context_menu_and_uninstall_workflow() {
         r"{}\*\shell\{}",
         cfg.classes_subkey, CONTEXT_MENU_KEY_NAME
     ));
+    let icon_reg = query_reg_named(
+        &format!(r"{}\*\shell\{}", cfg.classes_subkey, CONTEXT_MENU_KEY_NAME),
+        "Icon",
+    );
     assert_eq!(label, CONTEXT_MENU_LABEL);
+    assert!(icon_reg.contains("dot.ico,0"));
+    assert!(!icon_reg.to_ascii_lowercase().contains("python.exe"));
     for cmd_str in [&file_cmd_reg, &dir_cmd_reg, &bg_cmd_reg] {
         assert!(cmd_str.starts_with("wscript.exe //B //NoLogo"));
         assert!(cmd_str.contains("dot.vbs"));
@@ -172,10 +182,14 @@ fn full_install_cli_dot_context_menu_and_uninstall_workflow() {
 }
 
 fn query_reg_default(subkey: &str) -> String {
+    query_reg_named(subkey, "")
+}
+
+fn query_reg_named(subkey: &str, name: &str) -> String {
     let key = win::reg_open_key_Optional(win::HKEY_CURRENT_USER, subkey)
         .unwrap()
         .expect("registry key should exist");
-    win::reg_query_string(key.0, "").unwrap().unwrap().0
+    win::reg_query_string(key.0, name).unwrap().unwrap().0
 }
 
 fn run_shell_command_string(full_cmd: &str, cwd: &Path) {

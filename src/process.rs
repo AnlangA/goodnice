@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -9,7 +9,7 @@ use crate::pathutil::{
     is_tool_temp, is_within, is_xlsx, strip_prefix_ci, suffix, xlsx_intermediate_path,
     xlsx_write_path,
 };
-use crate::powershell;
+use crate::powershell::{self, PowerShellSession};
 
 pub struct ProcessConfig {
     pub output_dir: PathBuf,
@@ -59,7 +59,7 @@ fn copy_new(src: &Path, dst: &Path) -> io::Result<u64> {
         .open(dst)?;
     let mut guard = DeleteOnDrop::new(dst.to_path_buf());
     let n = io::copy(&mut from, &mut to)?;
-    to.sync_all()?;
+    to.flush()?;
     guard.disarm();
     Ok(n)
 }
@@ -75,7 +75,16 @@ pub fn planned_dest(source: &Path, input_root: Option<&Path>, output_dir: &Path)
     }
 }
 
+#[cfg(test)]
 pub fn process_file(source: &Path, cfg: &ProcessConfig) -> Result<FileOutcome> {
+    process_file_with_session(source, cfg, None)
+}
+
+pub fn process_file_with_session(
+    source: &Path,
+    cfg: &ProcessConfig,
+    session: Option<&mut PowerShellSession>,
+) -> Result<FileOutcome> {
     if !source.is_file() {
         bail!("文件不存在: {}", source.display());
     }
@@ -169,13 +178,20 @@ pub fn process_file(source: &Path, cfg: &ProcessConfig) -> Result<FileOutcome> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    powershell::write_bytes_via_powershell(
-        &cfg.powershell,
-        &data,
-        &dest_dir,
-        &dest_write,
-        cfg.verbose,
-    )?;
+    match session {
+        Some(sess) => {
+            sess.write_bytes(&data, &dest_dir, &dest_write, cfg.verbose)?;
+        }
+        None => {
+            powershell::write_bytes_via_powershell(
+                &cfg.powershell,
+                &data,
+                &dest_dir,
+                &dest_write,
+                cfg.verbose,
+            )?;
+        }
+    }
     vlog(
         cfg,
         "验证通过: 输出文件字节流与读取数据完全一致(由 PowerShell 校验)",

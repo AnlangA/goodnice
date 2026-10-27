@@ -61,4 +61,8 @@ pub struct Cli {
     /// 显示每一步的详细日志
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// 静默模式，不输出常规进度日志（供右键静默解密或脚本调用）
+    #[arg(short, long)]
+    pub quiet: bool,
 }

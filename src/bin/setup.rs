@@ -210,6 +210,7 @@ mod gui {
         font_normal: isize,
         font_title: isize,
         white_brush: isize,
+        app_icon: isize,
         lbl_header_title: isize,
         lbl_header_sub: isize,
         // Page 0: Welcome
@@ -356,6 +357,17 @@ mod gui {
         fn BeginPaint(hWnd: isize, lpPaint: *mut PAINTSTRUCT) -> isize;
         fn EndPaint(hWnd: isize, lpPaint: *const PAINTSTRUCT) -> i32;
         fn FillRect(hDC: isize, lprc: *const RECT, hbr: isize) -> i32;
+        fn DrawIconEx(
+            hdc: isize,
+            xLeft: i32,
+            yTop: i32,
+            hIcon: isize,
+            cxWidth: i32,
+            cyWidth: i32,
+            istepIfAniCur: u32,
+            hbrFlickerFreeDraw: isize,
+            diFlags: u32,
+        ) -> i32;
         fn GetSysColorBrush(nIndex: i32) -> isize;
         fn SetWindowLongPtrW(hWnd: isize, nIndex: i32, dwNewLong: isize) -> isize;
         fn GetWindowLongPtrW(hWnd: isize, nIndex: i32) -> isize;
@@ -434,6 +446,12 @@ mod gui {
             };
             let scale = (dpi_y as f32) / 96.0;
 
+            #[allow(clippy::manual_dangling_ptr)]
+            let mut app_icon = LoadIconW(h_instance, 1usize as *const u16);
+            if app_icon == 0 {
+                app_icon = LoadIconW(0, IDI_APPLICATION);
+            }
+
             let wc = WNDCLASSEXW {
                 cb_size: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 style: 0,
@@ -441,12 +459,12 @@ mod gui {
                 cb_cls_extra: 0,
                 cb_wnd_extra: 0,
                 h_instance,
-                h_icon: LoadIconW(0, IDI_APPLICATION),
+                h_icon: app_icon,
                 h_cursor: LoadCursorW(0, IDC_ARROW),
                 hbr_background: GetSysColorBrush(COLOR_BTNFACE),
                 lpsz_menu_name: null(),
                 lpsz_class_name: class_name.as_ptr(),
-                h_icon_sm: LoadIconW(0, IDI_APPLICATION),
+                h_icon_sm: app_icon,
             };
             RegisterClassExW(&wc);
 
@@ -493,6 +511,7 @@ mod gui {
                 font_normal,
                 font_title,
                 white_brush: GetSysColorBrush(COLOR_WINDOW),
+                app_icon,
                 lbl_header_title: 0,
                 lbl_header_sub: 0,
                 lbl_welcome: 0,
@@ -641,6 +660,20 @@ mod gui {
                             bottom: sc(66, st.scale),
                         };
                         FillRect(hdc, &header_rc, st.white_brush);
+                        if st.app_icon != 0 {
+                            let icon_sz = sc(38, st.scale);
+                            DrawIconEx(
+                                hdc,
+                                sc(480, st.scale),
+                                sc(14, st.scale),
+                                st.app_icon,
+                                icon_sz,
+                                icon_sz,
+                                0,
+                                0,
+                                0x0003, // DI_NORMAL
+                            );
+                        }
                     }
                     EndPaint(hwnd, &ps);
                     0

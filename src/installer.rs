@@ -11,6 +11,7 @@ pub const APP_NAME: &str = "Dot";
 pub const SHORTCUT_NAME: &str = "dot.lnk";
 pub const SHIM_NAME: &str = "dot.cmd";
 pub const VBS_SHIM_NAME: &str = "dot.vbs";
+pub const ICON_FILE_NAME: &str = "dot.ico";
 pub const PYTHON_EXE_NAME: &str = "python.exe";
 pub const UNINSTALL_EXE_NAME: &str = "uninstall.exe";
 pub const CONTEXT_MENU_KEY_NAME: &str = "GoodniceDot";
@@ -96,6 +97,10 @@ impl InstallConfig {
     pub fn vbs_shim_path(&self) -> PathBuf {
         self.start_menu_dir.join(VBS_SHIM_NAME)
     }
+
+    pub fn icon_path(&self) -> PathBuf {
+        self.start_menu_dir.join(ICON_FILE_NAME)
+    }
 }
 
 /// 生成文件右键菜单命令（通过 wscript.exe 静默无弹窗启动开始菜单目录下的 dot.vbs -> dot.lnk，不暴露 python.exe）
@@ -149,7 +154,7 @@ pub fn vbs_shim_script_content() -> &'static str {
         "    sh.CurrentDirectory = workDir\r\n",
         "    On Error GoTo 0\r\n",
         "End If\r\n",
-        "cmd = \"cmd.exe /d /s /c \"\"\"\"\" & lnk & \"\"\"\" & args & \"\"\"\"\r\n",
+        "cmd = \"cmd.exe /d /s /c \"\"\"\"\" & lnk & \"\"\" -q\" & args & \"\"\"\"\r\n",
         "code = sh.Run(cmd, 0, True)\r\n",
         "WScript.Quit code\r\n",
     )
@@ -272,9 +277,14 @@ where
     fs::create_dir_all(&cfg.start_menu_dir)
         .with_context(|| format!("创建开始菜单目录失败: {}", cfg.start_menu_dir.display()))?;
 
+    let ico_path = cfg.icon_path();
+    let ico_bytes = crate::icon::generate_unlocked_padlock_ico();
+    write_hidden_text_file(&ico_path, &ico_bytes)
+        .with_context(|| format!("写入解锁图标文件失败: {}", ico_path.display()))?;
+
     let shortcut = cfg.shortcut_path();
     on_progress(65, &format!("正在创建开始菜单快捷方式: {}", shortcut.display()));
-    create_shortcut(&shortcut, &py_path, "自动解密工具 (dot)")
+    create_shortcut(&shortcut, &py_path, &ico_path, "自动解密工具 (dot)")
         .with_context(|| format!("创建开始菜单快捷方式失败: {}", shortcut.display()))?;
 
     let shim = cfg.cmd_shim_path();
@@ -318,7 +328,12 @@ pub fn uninstall(cfg: &InstallConfig) -> Result<()> {
     unregister_uninstaller(cfg).context("移除卸载注册表项失败")?;
 
     if cfg.start_menu_dir.exists() {
-        for hidden_file in [cfg.cmd_shim_path(), cfg.vbs_shim_path(), cfg.shortcut_path()] {
+        for hidden_file in [
+            cfg.cmd_shim_path(),
+            cfg.vbs_shim_path(),
+            cfg.icon_path(),
+            cfg.shortcut_path(),
+        ] {
             if hidden_file.exists() {
                 let _ = win::clear_hidden_and_readonly(&hidden_file);
                 let _ = fs::remove_file(&hidden_file);
@@ -374,7 +389,12 @@ fn write_hidden_text_file(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(windows)]
-pub fn create_shortcut(shortcut_path: &Path, target_exe: &Path, description: &str) -> Result<()> {
+pub fn create_shortcut(
+    shortcut_path: &Path,
+    target_exe: &Path,
+    icon_path: &Path,
+    description: &str,
+) -> Result<()> {
     if let Some(parent) = shortcut_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -382,7 +402,7 @@ pub fn create_shortcut(shortcut_path: &Path, target_exe: &Path, description: &st
         let _ = win::clear_hidden_and_readonly(shortcut_path);
         let _ = fs::remove_file(shortcut_path);
     }
-    win::create_shell_link(shortcut_path, target_exe, description)
+    win::create_shell_link(shortcut_path, target_exe, icon_path, description)
 }
 
 #[cfg(windows)]
@@ -431,9 +451,8 @@ fn unregister_path_environment(cfg: &InstallConfig) -> Result<()> {
 #[cfg(windows)]
 fn register_context_menu(cfg: &InstallConfig) -> Result<()> {
     let hive = cfg.registry_hive.raw_handle();
-    let shortcut = cfg.shortcut_path();
     let vbs_shim = cfg.vbs_shim_path();
-    let icon_val = shortcut.to_string_lossy().into_owned();
+    let icon_val = format!("{},0", cfg.icon_path().display());
     let file_cmd = file_context_command(&vbs_shim);
     let dir_cmd = directory_context_command(&vbs_shim);
 
@@ -500,7 +519,7 @@ fn register_uninstaller(cfg: &InstallConfig) -> Result<()> {
     let uninst_exe = cfg.uninstall_exe_path();
     let uninst_cmd = format!("\"{}\"", uninst_exe.display());
     let quiet_cmd = format!("\"{}\" --quiet", uninst_exe.display());
-    let shortcut = cfg.shortcut_path();
+    let display_icon = format!("{},0", cfg.icon_path().display());
 
     win::reg_set_string(key.0, "DisplayName", "Dot (自动解密工具)", win::REG_SZ)?;
     win::reg_set_string(
@@ -516,12 +535,7 @@ fn register_uninstaller(cfg: &InstallConfig) -> Result<()> {
         &cfg.install_dir.to_string_lossy(),
         win::REG_SZ,
     )?;
-    win::reg_set_string(
-        key.0,
-        "DisplayIcon",
-        &shortcut.to_string_lossy(),
-        win::REG_SZ,
-    )?;
+    win::reg_set_string(key.0, "DisplayIcon", &display_icon, win::REG_SZ)?;
     win::reg_set_string(key.0, "UninstallString", &uninst_cmd, win::REG_SZ)?;
     win::reg_set_string(key.0, "QuietUninstallString", &quiet_cmd, win::REG_SZ)?;
     win::reg_set_dword(key.0, "NoModify", 1)?;
@@ -955,6 +969,7 @@ pub mod win {
     pub fn create_shell_link(
         shortcut_path: &Path,
         target_exe: &Path,
+        icon_path: &Path,
         description: &str,
     ) -> Result<()> {
         unsafe {
@@ -980,13 +995,14 @@ pub mod win {
             let vtbl = &*(*sl).lp_vtbl;
 
             let target_w = path_to_wide(target_exe);
+            let icon_w = path_to_wide(icon_path);
             let desc_w = to_wide(description);
             let empty_w = to_wide("");
 
             let hr_path = (vtbl.set_path)(shell_link_ptr, target_w.as_ptr());
             let _ = (vtbl.set_description)(shell_link_ptr, desc_w.as_ptr());
             let _ = (vtbl.set_working_directory)(shell_link_ptr, empty_w.as_ptr());
-            let _ = (vtbl.set_icon_location)(shell_link_ptr, target_w.as_ptr(), 0);
+            let _ = (vtbl.set_icon_location)(shell_link_ptr, icon_w.as_ptr(), 0);
 
             if hr_path < 0 {
                 (vtbl.release)(shell_link_ptr);

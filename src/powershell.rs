@@ -1,7 +1,7 @@
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -23,13 +23,14 @@ fn powershell_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     cmd
 }
 
-/// 从 stdin 读 base64，解码为原始字节并写入目标文件，再在 PowerShell 内比对 MD5。
-/// 路径通过环境变量传入，避免拼接进脚本时的转义问题。
+/// 单次调用脚本（供单文件或无常驻会话回退使用）。
+/// 已移除低效的全文正则 `-replace '\s', ''`，因为 Rust 侧标准 Base64 编码不含空白字符。
 const PS_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$b64 = [Console]::In.ReadToEnd() -replace '\s', ''
+$b64 = [Console]::In.ReadToEnd().Trim()
 $bytes = [Convert]::FromBase64String($b64)
 
 $outDir = $env:GOODNICE_OUT_DIR
@@ -41,50 +42,225 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 [System.IO.File]::WriteAllBytes($outFile, $bytes)
 
 $written = [System.IO.File]::ReadAllBytes($outFile)
+if ($bytes.Length -ne $written.Length) {
+    throw '验证失败: 写入文件的长度与接收的数据不一致!'
+}
 $md5 = [System.Security.Cryptography.MD5]::Create()
-$h1 = [BitConverter]::ToString($md5.ComputeHash($bytes))
-$h2 = [BitConverter]::ToString($md5.ComputeHash($written))
-if ($h1 -ne $h2) { throw '验证失败: 写入文件的字节流与接收的数据不一致!' }
+$h1 = $md5.ComputeHash($bytes)
+$h2 = $md5.ComputeHash($written)
+for ($i = 0; $i -lt $h1.Length; $i++) {
+    if ($h1[$i] -ne $h2[$i]) {
+        throw '验证失败: 写入文件的字节流与接收的数据不一致!'
+    }
+}
 
 if ($env:GOODNICE_VERBOSE -eq '1') {
-    $fi = Get-Item $outFile
+    $fi = Get-Item -LiteralPath $outFile
     [Console]::Out.WriteLine('PowerShell written: ' + $fi.FullName + ' (' + $fi.Length + ' bytes)')
     [Console]::Out.WriteLine('PowerShell 验证通过: 写入字节流与接收数据完全一致')
 }
 "#;
 
+/// 常驻 PowerShell 工作进程脚本：
+/// 批量处理多个文件时只启动一次 PowerShell / .NET 运行时，复用同一个 MD5 实例，消除每个文件 300~600ms 的进程启动开销。
+const PS_WORKER_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+$md5 = [System.Security.Cryptography.MD5]::Create()
+[Console]::Out.WriteLine('GOODNICE_READY')
+[Console]::Out.Flush()
+
+while ($true) {
+    $header = [Console]::In.ReadLine()
+    if ($null -eq $header -or $header -eq 'EXIT') { break }
+    try {
+        $parts = $header.Split('|', 3)
+        if ($parts.Length -lt 3) {
+            throw '内部协议错误: 请求头格式无效'
+        }
+        $verbose = $parts[0]
+        $outDir = $utf8.GetString([Convert]::FromBase64String($parts[1]))
+        $outFile = $utf8.GetString([Convert]::FromBase64String($parts[2]))
+        $b64 = [Console]::In.ReadLine()
+        if ($null -eq $b64) {
+            throw '内部协议错误: 未收到文件字节流负载'
+        }
+        $bytes = [Convert]::FromBase64String($b64)
+
+        if (-not [System.IO.Directory]::Exists($outDir)) {
+            [System.IO.Directory]::CreateDirectory($outDir) | Out-Null
+        }
+        [System.IO.File]::WriteAllBytes($outFile, $bytes)
+
+        $written = [System.IO.File]::ReadAllBytes($outFile)
+        if ($bytes.Length -ne $written.Length) {
+            throw '验证失败: 写入文件的长度与接收的数据不一致!'
+        }
+        $h1 = $md5.ComputeHash($bytes)
+        $h2 = $md5.ComputeHash($written)
+        for ($i = 0; $i -lt $h1.Length; $i++) {
+            if ($h1[$i] -ne $h2[$i]) {
+                throw '验证失败: 写入文件的字节流与接收的数据不一致!'
+            }
+        }
+
+        if ($verbose -eq '1') {
+            [Console]::Out.WriteLine('GOODNICE_LOG|PowerShell written: ' + $outFile + ' (' + $written.Length + ' bytes)')
+            [Console]::Out.WriteLine('GOODNICE_LOG|PowerShell 验证通过: 写入字节流与接收数据完全一致')
+        }
+        [Console]::Out.WriteLine('GOODNICE_OK')
+        [Console]::Out.Flush()
+    } catch {
+        $errMsg = $_.Exception.Message -replace '[\r\n]+', ' '
+        [Console]::Out.WriteLine('GOODNICE_ERR|' + $errMsg)
+        [Console]::Out.Flush()
+    }
+}
+"#;
+
 const CANDIDATES: &[&str] = &["powershell.exe", "pwsh.exe", "powershell", "pwsh"];
 
-/// 查找本机可用的 PowerShell。优先 Windows PowerShell 5.x（与原 Python 脚本一致）。
-pub fn detect_powershell() -> Result<OsString> {
-    let mut last_err = None;
-    for prog in CANDIDATES {
-        match powershell_command(prog)
+/// 常驻 PowerShell 写入与校验会话，在批量处理时消除重复启动 PowerShell 子进程的开销。
+pub struct PowerShellSession {
+    program: OsString,
+    child: Child,
+    stdin: BufWriter<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl PowerShellSession {
+    /// 自动探测可用 PowerShell 并直接启动常驻工作进程（同时完成可用性校验与预热）。
+    pub fn spawn_auto() -> Result<Self> {
+        let mut last_err = None;
+        for prog in CANDIDATES {
+            let os_prog = OsString::from(prog);
+            match Self::spawn(os_prog) {
+                Ok(session) => return Ok(session),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| anyhow!("未找到 PowerShell"))
+            .context("未找到可用的 PowerShell（powershell.exe / pwsh）。写入必须由 PowerShell 完成"))
+    }
+
+    pub fn spawn(program: OsString) -> Result<Self> {
+        let encoded = encode_command(PS_WORKER_SCRIPT);
+        let mut child = powershell_command(&program)
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-NoLogo",
-                "-Command",
-                "$ProgressPreference='SilentlyContinue'; exit 0",
+                "-EncodedCommand",
+                &encoded,
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null())
-            .output()
-        {
-            Ok(output) if output.status.success() => return Ok(OsString::from(prog)),
-            Ok(output) => {
-                last_err = Some(anyhow!(
-                    "{prog} 退出码 {}",
-                    output.status.code().unwrap_or(-1)
-                ));
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("无法启动 PowerShell: {}", program.to_string_lossy()))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("无法打开 PowerShell stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("无法打开 PowerShell stdout"))?;
+
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .context("等待 PowerShell 工作进程就绪失败")?;
+            if n == 0 {
+                let status = child.wait().ok();
+                bail!(
+                    "PowerShell 工作进程启动失败 (退出码 {:?})",
+                    status.and_then(|s| s.code())
+                );
             }
-            Err(err) => last_err = Some(err.into()),
+            if line.trim() == "GOODNICE_READY" {
+                break;
+            }
+        }
+
+        Ok(Self {
+            program,
+            child,
+            stdin: BufWriter::with_capacity(64 * 1024, stdin),
+            stdout: reader,
+        })
+    }
+
+    pub fn program(&self) -> &OsString {
+        &self.program
+    }
+
+    pub fn write_bytes(
+        &mut self,
+        data: &[u8],
+        dest_dir: &Path,
+        dest_file: &Path,
+        verbose: bool,
+    ) -> Result<()> {
+        let dir_b64 = STANDARD.encode(dest_dir.to_string_lossy().as_bytes());
+        let file_b64 = STANDARD.encode(dest_file.to_string_lossy().as_bytes());
+        let v_flag = if verbose { "1" } else { "0" };
+
+        writeln!(self.stdin, "{v_flag}|{dir_b64}|{file_b64}")
+            .context("向 PowerShell 会话发送请求头失败")?;
+        let payload = STANDARD.encode(data);
+        self.stdin
+            .write_all(payload.as_bytes())
+            .context("向 PowerShell 会话写入字节流失败")?;
+        self.stdin
+            .write_all(b"\n")
+            .context("向 PowerShell 会话写入换行符失败")?;
+        self.stdin.flush().context("刷新 PowerShell 会话输入流失败")?;
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self
+                .stdout
+                .read_line(&mut line)
+                .context("读取 PowerShell 会话响应失败")?;
+            if n == 0 {
+                bail!(
+                    "PowerShell 会话意外终止。目标: {}",
+                    dest_file.display()
+                );
+            }
+            let trimmed = line.trim();
+            if let Some(log_msg) = trimmed.strip_prefix("GOODNICE_LOG|") {
+                if verbose {
+                    println!("    {log_msg}");
+                }
+            } else if trimmed == "GOODNICE_OK" {
+                return Ok(());
+            } else if let Some(err_msg) = trimmed.strip_prefix("GOODNICE_ERR|") {
+                bail!(
+                    "PowerShell 写入失败: {err_msg}。目标: {}",
+                    dest_file.display()
+                );
+            }
         }
     }
-    Err(last_err
-        .unwrap_or_else(|| anyhow!("未找到 PowerShell"))
-        .context("未找到可用的 PowerShell（powershell.exe / pwsh）。写入必须由 PowerShell 完成"))
+}
+
+impl Drop for PowerShellSession {
+    fn drop(&mut self) {
+        let _ = writeln!(self.stdin, "EXIT");
+        let _ = self.stdin.flush();
+        let _ = self.child.wait();
+    }
 }
 
 fn encode_command(script: &str) -> String {
@@ -96,9 +272,7 @@ fn encode_command(script: &str) -> String {
     STANDARD.encode(bytes)
 }
 
-/// 把原始字节流交给 PowerShell，由其写入目标文件。
-///
-/// 字节流以 base64 通过 stdin 传递，脚本以 `-EncodedCommand` 传递，避免转义问题。
+/// 把原始字节流交给单次 PowerShell 进程，由其写入目标文件并校验 MD5。
 pub fn write_bytes_via_powershell(
     powershell: &OsString,
     data: &[u8],

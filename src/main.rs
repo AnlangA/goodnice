@@ -16,8 +16,10 @@ use clap::Parser;
 use cli::Cli;
 use discover::{DiscoverOptions, collect_files};
 use pathutil::{absolute, normalize_ext, same_path, strip_prefix_ci};
+use powershell::PowerShellSession;
 use process::{
-    FileOutcome, ProcessConfig, cleanup_output_dir, planned_dest, process_file, validate_output_dir,
+    FileOutcome, ProcessConfig, cleanup_output_dir, planned_dest, process_file_with_session,
+    validate_output_dir,
 };
 
 fn main() -> ExitCode {
@@ -40,12 +42,6 @@ fn run() -> Result<ExitCode> {
 
     let output_dir = resolve_output_dir(&cli, &paths);
     let extensions: Vec<String> = cli.extension.iter().map(|e| normalize_ext(e)).collect();
-
-    let powershell = if cli.dry_run {
-        OsString::from("powershell.exe")
-    } else {
-        powershell::detect_powershell()?
-    };
 
     let mut jobs: Vec<Job> = Vec::new();
     for path in &paths {
@@ -108,7 +104,9 @@ fn run() -> Result<ExitCode> {
     }
 
     if jobs.is_empty() {
-        println!("没有需要处理的文件");
+        if !cli.quiet {
+            println!("没有需要处理的文件");
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -118,7 +116,17 @@ fn run() -> Result<ExitCode> {
     }
     warn_destination_collisions(&jobs);
 
-    if cli.verbose || cli.dry_run {
+    let mut ps_session = if cli.dry_run {
+        None
+    } else {
+        Some(PowerShellSession::spawn_auto()?)
+    };
+    let powershell_prog = ps_session
+        .as_ref()
+        .map(|s| s.program().clone())
+        .unwrap_or_else(|| OsString::from("powershell.exe"));
+
+    if (cli.verbose || cli.dry_run) && !cli.quiet {
         let mode = if cli.dry_run {
             "预览"
         } else {
@@ -135,18 +143,20 @@ fn run() -> Result<ExitCode> {
     for (i, job) in jobs.iter().enumerate() {
         let idx = i + 1;
         let label = display_source(&job.source, job.input_root.as_deref());
-        if !cli.verbose {
-            print!("[{idx}/{total}] {label} ... ");
-            let _ = io::stdout().flush();
-        } else {
-            println!("[{idx}/{total}] {label}");
+        if !cli.quiet {
+            if !cli.verbose {
+                print!("[{idx}/{total}] {label} ... ");
+                let _ = io::stdout().flush();
+            } else {
+                println!("[{idx}/{total}] {label}");
+            }
         }
 
         let cfg = ProcessConfig {
             output_dir: output_dir.clone(),
             input_root: job.input_root.clone(),
-            powershell: powershell.clone(),
-            verbose: cli.verbose,
+            powershell: powershell_prog.clone(),
+            verbose: cli.verbose && !cli.quiet,
             dry_run: cli.dry_run,
         };
 
@@ -159,17 +169,19 @@ fn run() -> Result<ExitCode> {
                 job.dest.display()
             ))
         } else {
-            process_file(&job.source, &cfg)
+            process_file_with_session(&job.source, &cfg, ps_session.as_mut())
         };
         match result {
             Ok(outcome) => {
                 ok += 1;
-                print_success(&outcome, cli.verbose, cli.dry_run);
+                if !cli.quiet {
+                    print_success(&outcome, cli.verbose, cli.dry_run);
+                }
             }
             Err(err) => {
                 fail += 1;
                 failed_outputs.push(job.dest.clone());
-                if !cli.verbose {
+                if !cli.quiet && !cli.verbose {
                     println!("失败");
                 }
                 eprintln!("    {err:#}");
@@ -181,13 +193,15 @@ fn run() -> Result<ExitCode> {
     }
 
     if cli.dry_run {
-        println!(
-            "[dry-run] 全部成功后删除空输出目录: {}",
-            output_dir.display()
-        );
+        if !cli.quiet {
+            println!(
+                "[dry-run] 全部成功后删除空输出目录: {}",
+                output_dir.display()
+            );
+        }
     } else if fail == 0 {
         if cleanup_output_dir(&output_dir)? {
-            if cli.verbose {
+            if cli.verbose && !cli.quiet {
                 println!("已删除输出目录: {}", output_dir.display());
             }
         } else {
@@ -200,11 +214,13 @@ fn run() -> Result<ExitCode> {
         );
     }
 
-    println!();
-    println!(
-        "完成: 成功 {ok}, 失败 {fail}, 合计 {total}{}",
-        if cli.dry_run { " (dry-run)" } else { "" }
-    );
+    if !cli.quiet {
+        println!();
+        println!(
+            "完成: 成功 {ok}, 失败 {fail}, 合计 {total}{}",
+            if cli.dry_run { " (dry-run)" } else { "" }
+        );
+    }
 
     if fail > 0 {
         Ok(ExitCode::from(1))
