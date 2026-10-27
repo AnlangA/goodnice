@@ -23,6 +23,28 @@ fn powershell_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     cmd
 }
 
+/// 单次调用临时缓存创建脚本（由非受控的 PowerShell 将原始密文字节流写入系统临时缓存句柄，避免 python.exe 写入 .xlsx 时触发二次加密）：
+const PS_STAGE_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+$sourceFile = $env:GOODNICE_SOURCE_FILE
+$tempXlsx = $env:GOODNICE_TEMP_XLSX
+if ([string]::IsNullOrWhiteSpace($sourceFile) -or [string]::IsNullOrWhiteSpace($tempXlsx)) {
+    throw '内部错误: 未设置 GOODNICE_SOURCE_FILE / GOODNICE_TEMP_XLSX'
+}
+
+$tempDir = [System.IO.Path]::GetDirectoryName($tempXlsx)
+if (-not [string]::IsNullOrWhiteSpace($tempDir) -and -not [System.IO.Directory]::Exists($tempDir)) {
+    [System.IO.Directory]::CreateDirectory($tempDir) | Out-Null
+}
+
+[System.IO.File]::Copy($sourceFile, $tempXlsx, $true)
+[System.IO.File]::SetAttributes($tempXlsx, [System.IO.FileAttributes]::Temporary -bor [System.IO.FileAttributes]::Hidden)
+"#;
+
 /// 单次调用脚本（供单文件或无常驻会话回退使用）：
 /// 字节流在内存中解码并计算 MD5，处理完成后直接将最终文件存盘至源文件位置（若源文件被锁无法替换则回退保存至输出目录）。
 const PS_SCRIPT: &str = r#"
@@ -87,7 +109,8 @@ if ($env:GOODNICE_VERBOSE -eq '1') {
 "#;
 
 /// 常驻 PowerShell 工作进程脚本：
-/// 全程在内存中接收字节流并计算哈希，处理完成后直接将最终文件写入目标盘位（无需在磁盘创建临时输出目录和中间输出文件）。
+/// 支持 STAGE（将非 xlsx 源文件的原始密文缓存到系统内存临时目录，绝不在源目录产生中间文件，且避免 python.exe 写入触发二次加密）
+/// 与 WRITE（全程在内存中接收解密字节流并计算哈希，处理完成后直接将最终文件写入目标盘位）。
 const PS_WORKER_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -102,6 +125,28 @@ while ($true) {
     $header = [Console]::In.ReadLine()
     if ($null -eq $header -or $header -eq 'EXIT') { break }
     try {
+        if ($header.StartsWith('STAGE|')) {
+            $parts = $header.Split('|', 4)
+            if ($parts.Length -lt 4) {
+                throw '内部协议错误: STAGE 请求头格式无效'
+            }
+            $verbose = $parts[1]
+            $sourceFile = $utf8.GetString([Convert]::FromBase64String($parts[2]))
+            $tempXlsx = $utf8.GetString([Convert]::FromBase64String($parts[3]))
+            $tempDir = [System.IO.Path]::GetDirectoryName($tempXlsx)
+            if (-not [string]::IsNullOrWhiteSpace($tempDir) -and -not [System.IO.Directory]::Exists($tempDir)) {
+                [System.IO.Directory]::CreateDirectory($tempDir) | Out-Null
+            }
+            [System.IO.File]::Copy($sourceFile, $tempXlsx, $true)
+            [System.IO.File]::SetAttributes($tempXlsx, [System.IO.FileAttributes]::Temporary -bor [System.IO.FileAttributes]::Hidden)
+            if ($verbose -eq '1') {
+                [Console]::Out.WriteLine('GOODNICE_LOG|已在系统临时区构建 .xlsx 解密句柄: ' + $tempXlsx)
+            }
+            [Console]::Out.WriteLine('GOODNICE_OK')
+            [Console]::Out.Flush()
+            continue
+        }
+
         $parts = $header.Split('|', 4)
         if ($parts.Length -lt 4) {
             throw '内部协议错误: 请求头格式无效'
@@ -253,6 +298,53 @@ impl PowerShellSession {
         &self.program
     }
 
+    /// 由常驻 PowerShell 将非 `.xlsx` 源文件的原始密文缓存至系统临时目录中的 `.xlsx` 内存缓存句柄，
+    /// 绝不在源目录生成任何中间文件，同时避免 `python.exe` 写入 `.xlsx` 时触发加密驱动二次加密。
+    pub fn stage_temp_xlsx(
+        &mut self,
+        source_file: &Path,
+        temp_xlsx: &Path,
+        verbose: bool,
+    ) -> Result<()> {
+        let src_b64 = STANDARD.encode(source_file.to_string_lossy().as_bytes());
+        let tmp_b64 = STANDARD.encode(temp_xlsx.to_string_lossy().as_bytes());
+        let v_flag = if verbose { "1" } else { "0" };
+
+        writeln!(self.stdin, "STAGE|{v_flag}|{src_b64}|{tmp_b64}")
+            .context("向 PowerShell 会话发送 STAGE 请求头失败")?;
+        self.stdin
+            .flush()
+            .context("刷新 PowerShell 会话输入流失败")?;
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self
+                .stdout
+                .read_line(&mut line)
+                .context("读取 PowerShell 会话 STAGE 响应失败")?;
+            if n == 0 {
+                bail!(
+                    "PowerShell 会话意外终止。目标: {}",
+                    source_file.display()
+                );
+            }
+            let trimmed = line.trim();
+            if let Some(log_msg) = trimmed.strip_prefix("GOODNICE_LOG|") {
+                if verbose {
+                    println!("    {log_msg}");
+                }
+            } else if trimmed == "GOODNICE_OK" {
+                return Ok(());
+            } else if let Some(err_msg) = trimmed.strip_prefix("GOODNICE_ERR|") {
+                bail!(
+                    "构建内存缓存句柄失败: {err_msg}。源: {}",
+                    source_file.display()
+                );
+            }
+        }
+    }
+
     /// 将内存中的字节流直接通过常驻 PowerShell 校验并存盘至 `source_file`（若源文件被锁无法替换则保存至 `fallback_file`）。
     pub fn write_final_file(
         &mut self,
@@ -329,6 +421,45 @@ fn encode_command(script: &str) -> String {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
     STANDARD.encode(bytes)
+}
+
+/// 由单次 PowerShell 进程将非 `.xlsx` 源文件的原始密文缓存至系统临时目录中的 `.xlsx` 句柄。
+pub fn stage_temp_xlsx_via_powershell(
+    powershell: &OsString,
+    source_file: &Path,
+    temp_xlsx: &Path,
+    verbose: bool,
+) -> Result<()> {
+    let encoded = encode_command(PS_STAGE_SCRIPT);
+    let output = powershell_command(powershell)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-NoLogo",
+            "-EncodedCommand",
+            &encoded,
+        ])
+        .env("GOODNICE_SOURCE_FILE", source_file.as_os_str())
+        .env("GOODNICE_TEMP_XLSX", temp_xlsx.as_os_str())
+        .env("GOODNICE_VERBOSE", if verbose { "1" } else { "0" })
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("无法启动 PowerShell: {}", powershell.to_string_lossy()))?;
+
+    if !output.status.success() {
+        let stderr = strip_clixml(&String::from_utf8_lossy(&output.stderr));
+        let stdout = strip_clixml(&String::from_utf8_lossy(&output.stdout));
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        bail!(
+            "PowerShell 构建内存缓存句柄失败 (退出码 {}): {}。源: {}",
+            output.status.code().unwrap_or(-1),
+            detail,
+            source_file.display()
+        );
+    }
+    Ok(())
 }
 
 /// 把内存中的原始字节流交给单次 PowerShell 进程，直接写入最终目标文件并校验 MD5。

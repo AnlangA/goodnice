@@ -1,6 +1,10 @@
 use std::env;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// 与 Python `pathlib.Path.suffix` 一致：只取最后一段扩展名；
 /// `.gitignore` 这类以点开头且无其它点的名字视为无扩展名。
@@ -17,6 +21,7 @@ pub fn suffix(path: &Path) -> String {
 
 /// 与 Python `Path.with_suffix` 一致。`new_suffix` 应带点，如 `.xlsx`；
 /// 空字符串表示去掉扩展名。
+#[cfg(test)]
 pub fn with_suffix(path: &Path, new_suffix: &str) -> PathBuf {
     let name = match path.file_name() {
         Some(n) => n.to_string_lossy().into_owned(),
@@ -56,6 +61,7 @@ pub fn is_tool_temp(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn unique_marked_xlsx(dir: &Path, file_stem: &str) -> PathBuf {
     for n in 1u32.. {
         let name = format!("{file_stem}{TEMP_MARK}{n}.xlsx");
@@ -68,9 +74,25 @@ fn unique_marked_xlsx(dir: &Path, file_stem: &str) -> PathBuf {
 }
 
 /// 非 xlsx 源文件的中间副本。始终带 `.goodnice-` 标记，绝不占用用户已有的同名 `.xlsx`。
+#[cfg(test)]
 pub fn xlsx_intermediate_path(source: &Path) -> PathBuf {
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
     unique_marked_xlsx(parent, &stem(source))
+}
+
+/// 在系统临时目录（`%TEMP%\goodnice-cache`）中生成唯一的临时 `.xlsx` 内存缓存句柄路径，
+/// 确保用户源目录中绝不产生任何 `.xlsx` 中间文件。
+pub fn ram_temp_xlsx_path(source: &Path) -> PathBuf {
+    let base = env::temp_dir().join("goodnice-cache");
+    let pid = process::id();
+    let file_stem = stem(source);
+    loop {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = base.join(format!("{file_stem}{TEMP_MARK}{pid}-{seq}.xlsx"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
 }
 
 /// 转成绝对路径，但不调用 canonicalize，避免 Windows 上出现 `\\?\` 前缀。

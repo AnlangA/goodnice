@@ -3,21 +3,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-#[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
-
 use anyhow::{Context, Result, bail};
 
-use crate::pathutil::{
-    is_within, is_xlsx, strip_prefix_ci, suffix, xlsx_intermediate_path,
-};
+use crate::pathutil::{is_within, is_xlsx, ram_temp_xlsx_path, strip_prefix_ci, suffix};
 use crate::powershell::{self, PowerShellSession};
-
-/// Windows 内核页缓存临时标志 + 隐藏属性：
-/// `FILE_ATTRIBUTE_TEMPORARY (0x0100)` 指示 Windows Cache Manager 将临时 `.xlsx` 句柄数据驻留在内存缓存中，不主动刷写到物理磁盘；
-/// `FILE_ATTRIBUTE_HIDDEN (0x0002)` 在资源管理器中隐藏该临时句柄。
-#[cfg(windows)]
-const TEMP_CACHE_FILE_FLAGS: u32 = 0x0000_0100 | 0x0000_0002;
 
 pub struct ProcessConfig {
     pub output_dir: PathBuf,
@@ -51,27 +40,17 @@ impl DeleteOnDrop {
 
 impl Drop for DeleteOnDrop {
     fn drop(&mut self) {
-        // 仅删除本次 create_new 得到的副本；成功路径会先显式删除并 disarm。
-        if self.armed && self.path.exists() {
-            let _ = fs::remove_file(&self.path);
+        if self.armed {
+            cleanup_temp_xlsx(&self.path);
         }
     }
 }
 
-/// 创建内核内存缓存的临时 `.xlsx` 句柄（存在则失败，避免覆盖用户已有的 `.xlsx`），不强制刷盘。
-fn copy_new(src: &Path, dst: &Path) -> io::Result<u64> {
-    let mut from = fs::File::open(src)?;
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(windows)]
-    {
-        opts.custom_flags(TEMP_CACHE_FILE_FLAGS);
+fn cleanup_temp_xlsx(path: &Path) {
+    let _ = fs::remove_file(path);
+    if let Some(parent) = path.parent() {
+        let _ = fs::remove_dir(parent);
     }
-    let mut to = opts.open(dst)?;
-    let mut guard = DeleteOnDrop::new(dst.to_path_buf());
-    let n = io::copy(&mut from, &mut to)?;
-    guard.disarm();
-    Ok(n)
 }
 
 /// 计算源文件在回退输出目录中的路径（仅当源文件被占用无法原位落盘时使用）。
@@ -93,7 +72,7 @@ pub fn process_file(source: &Path, cfg: &ProcessConfig) -> Result<FileOutcome> {
 pub fn process_file_with_session(
     source: &Path,
     cfg: &ProcessConfig,
-    session: Option<&mut PowerShellSession>,
+    mut session: Option<&mut PowerShellSession>,
 ) -> Result<FileOutcome> {
     if !source.is_file() {
         bail!("文件不存在: {}", source.display());
@@ -119,7 +98,8 @@ pub fn process_file_with_session(
         });
     }
 
-    // 第 1 步：非 xlsx 则创建内存页缓存的临时 xlsx 句柄（FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_HIDDEN）
+    // 第 1 步：非 xlsx 文件通过不受加密策略控制的 PowerShell 在系统临时区构建 .xlsx 句柄
+    // （避免在用户源目录产生任何中间文件，同时防止 python.exe 写入 .xlsx 时触发亿赛通二次加密）
     let mut tmp_guard: Option<DeleteOnDrop> = None;
     let read_path = if originally_xlsx {
         vlog(cfg, "已是 xlsx 格式，直接进入内存读取");
@@ -136,47 +116,45 @@ pub fn process_file_with_session(
                 }
             ),
         );
-        let sibling = crate::pathutil::with_suffix(source, ".xlsx");
-        let xlsx_file = match copy_new(source, &sibling) {
-            Ok(_) => sibling,
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                let marked = xlsx_intermediate_path(source);
-                copy_new(source, &marked).with_context(|| {
-                    format!(
-                        "创建临时 xlsx 缓存失败: {} -> {}",
-                        source.display(),
-                        marked.display()
-                    )
-                })?;
-                marked
+        let temp_xlsx = ram_temp_xlsx_path(source);
+        let guard = DeleteOnDrop::new(temp_xlsx.clone());
+        match session.as_deref_mut() {
+            Some(sess) => {
+                sess.stage_temp_xlsx(source, &temp_xlsx, cfg.verbose)?;
             }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "创建临时 xlsx 缓存失败: {} -> {}",
-                        source.display(),
-                        sibling.display()
-                    )
-                });
+            None => {
+                powershell::stage_temp_xlsx_via_powershell(
+                    &cfg.powershell,
+                    source,
+                    &temp_xlsx,
+                    cfg.verbose,
+                )?;
             }
-        };
-        vlog(
-            cfg,
-            &format!(
-                "已在内存缓存创建临时 xlsx 句柄: {} (原文件保留)",
-                xlsx_file.display()
-            ),
-        );
-        tmp_guard = Some(DeleteOnDrop::new(xlsx_file.clone()));
-        xlsx_file
+        }
+        tmp_guard = Some(guard);
+        temp_xlsx
     };
 
-    // 第 2 步：将解密后的字节流读入内存，全程在内存中经管道传给 PowerShell 校验并直接将最终文件存盘
-    vlog(cfg, &format!("读取字节流至内存: {}", read_path.display()));
+    // 第 2 步：由具备亿赛通表格解密权限的 python.exe 将字节流读入内存（触发透明解密），并立即清理系统临时区句柄
+    vlog(cfg, &format!("读取解密字节流至内存: {}", read_path.display()));
     let data =
         fs::read(&read_path).with_context(|| format!("读取失败: {}", read_path.display()))?;
     vlog(cfg, &format!("内存已缓存 {} 字节", data.len()));
 
+    if let Some(guard) = tmp_guard.as_mut() {
+        remove_file_best_effort(&guard.path)
+            .with_context(|| format!("删除临时文件失败: {}", guard.path.display()))?;
+        if let Some(parent) = guard.path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+        vlog(
+            cfg,
+            &format!("已清理临时 xlsx 句柄: {}", guard.path.display()),
+        );
+        guard.disarm();
+    }
+
+    // 第 3 步：将内存中的解密字节流通过管道传给 PowerShell 校验并直接存盘至原路径
     let dest_dir = dest_final
         .parent()
         .map(Path::to_path_buf)
@@ -204,17 +182,6 @@ pub fn process_file_with_session(
             source.display()
         ),
     );
-
-    // 第 3 步：最终文件存盘完成后，立即删除临时 xlsx 缓存句柄
-    if let Some(guard) = tmp_guard.as_mut() {
-        remove_file_best_effort(&guard.path)
-            .with_context(|| format!("删除临时文件失败: {}", guard.path.display()))?;
-        vlog(
-            cfg,
-            &format!("已删除临时 xlsx 缓存文件: {}", guard.path.display()),
-        );
-        guard.disarm();
-    }
 
     Ok(FileOutcome {
         dest: source.to_path_buf(),
@@ -310,19 +277,22 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn copy_new_marks_temporary_and_hidden_attributes_in_ram_cache() {
+    fn stage_temp_xlsx_marks_temporary_and_hidden_in_system_temp() {
         use std::os::windows::fs::MetadataExt;
         let dir = tempdir().unwrap();
         let src = dir.path().join("a.pdf");
-        let dst = dir.path().join("a.xlsx");
         fs::write(&src, b"in-memory-cache-payload").unwrap();
 
-        let n = copy_new(&src, &dst).unwrap();
-        assert_eq!(n, 23);
+        let dst = ram_temp_xlsx_path(&src);
+        assert_ne!(dst.parent(), Some(dir.path()));
+        let mut sess = PowerShellSession::spawn_auto().unwrap();
+        sess.stage_temp_xlsx(&src, &dst, false).unwrap();
+
         let attrs = fs::metadata(&dst).unwrap().file_attributes();
         // FILE_ATTRIBUTE_TEMPORARY (0x100) | FILE_ATTRIBUTE_HIDDEN (0x2)
-        assert_ne!(attrs & 0x0000_0100, 0, "應帶有 FILE_ATTRIBUTE_TEMPORARY 標誌");
-        assert_ne!(attrs & 0x0000_0002, 0, "應帶有 FILE_ATTRIBUTE_HIDDEN 標誌");
+        assert_ne!(attrs & 0x0000_0100, 0, "应带有 FILE_ATTRIBUTE_TEMPORARY 标志");
+        assert_ne!(attrs & 0x0000_0002, 0, "应带有 FILE_ATTRIBUTE_HIDDEN 标志");
+        cleanup_temp_xlsx(&dst);
     }
 
     #[test]
